@@ -26,11 +26,21 @@ def create_index(embedding_dim: int, metric: str = "cosine") -> faiss.Index:
 
 
 def save_index(index: faiss.Index, index_path: str | Path) -> Path:
+    """Persist a FAISS index to disk.
+
+    Uses ``faiss.serialize_index`` + Python file I/O instead of
+    ``faiss.write_index`` to sidestep a known Windows bug where the C++
+    ``fopen`` cannot resolve paths containing non-ASCII characters
+    (e.g. usernames with accents like ``Peña``).
+    """
     index_path = Path(index_path)
     index_path.parent.mkdir(parents=True, exist_ok=True)
-    faiss.write_index(index, str(index_path))
+    payload = faiss.serialize_index(index)
+    index_path.write_bytes(bytes(payload))
     return index_path
 
 
 def load_index(index_path: str | Path) -> faiss.Index:
-    return faiss.read_index(str(Path(index_path)))
+    """Load a FAISS index from disk via Python I/O (Windows non-ASCII safe)."""
+    data = Path(index_path).read_bytes()
+    return faiss.deserialize_index(np.frombuffer(data, dtype=np.uint8))
