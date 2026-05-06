@@ -1,6 +1,35 @@
+"""Feature-extractor backbones for the VPR pipeline.
+
+Two families are exposed:
+
+* ``resnet50`` — the original baseline. Frozen, ImageNet-pretrained,
+  outputs 2048-d global features (the average pool before the final FC
+  layer).
+* ``dinov2_vits14`` / ``dinov2_vitb14`` / ``dinov2_vitl14`` — Meta AI's
+  self-supervised ViT family. Pretrained on LVD-142M, frozen, returns the
+  ``[CLS]`` token (384 / 768 / 1024 dim respectively). Empirically these
+  give a large boost on retrieval tasks because the model was trained
+  with discrimination as the objective rather than ImageNet
+  classification.
+
+All backbones return a single feature vector per image so the rest of
+the pipeline (FAISS index, search, evaluation, demo) is unchanged.
+"""
+
+from __future__ import annotations
+
 import torch
 from torch import nn
 from torchvision.models import ResNet50_Weights, resnet50
+
+
+_DINOV2_HUB_NAMES = {
+    "dinov2_vits14": ("dinov2_vits14", 384),
+    "dinov2_vits14_hires": ("dinov2_vits14", 384),
+    "dinov2_vitb14": ("dinov2_vitb14", 768),
+    "dinov2_vitb14_hires": ("dinov2_vitb14", 768),
+    "dinov2_vitl14": ("dinov2_vitl14", 1024),
+}
 
 
 class GlobalFeatureExtractor(nn.Module):
@@ -15,6 +44,34 @@ class GlobalFeatureExtractor(nn.Module):
         return torch.flatten(features, start_dim=1)
 
 
+class DinoV2FeatureExtractor(nn.Module):
+    """Adapt a torch.hub-loaded DINOv2 backbone to our pipeline.
+
+    DINOv2's forward returns the [CLS] token features directly, but
+    ``forward_features`` exposes the full set of patch tokens. We use the
+    [CLS] token because it is the canonical global descriptor used in the
+    DINOv2 paper for image-level retrieval / classification probes.
+    """
+
+    def __init__(self, backbone: nn.Module) -> None:
+        super().__init__()
+        self.backbone = backbone
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        # Newer DINOv2 checkpoints return the CLS token from forward(); fall
+        # back to ``forward_features`` if forward returns a dict.
+        out = self.backbone(images)
+        if isinstance(out, dict):
+            for key in ("x_norm_clstoken", "x_clstoken", "cls_token"):
+                if key in out:
+                    return out[key]
+            raise RuntimeError(f"Unexpected DINOv2 output keys: {list(out.keys())}")
+        if out.dim() == 3:
+            # (batch, tokens, dim) — first token is CLS by convention.
+            return out[:, 0]
+        return out
+
+
 def resolve_device(device: str | None = None) -> torch.device:
     if device is not None:
         return torch.device(device)
@@ -23,22 +80,47 @@ def resolve_device(device: str | None = None) -> torch.device:
     return torch.device("cpu")
 
 
+def _load_resnet50(pretrained: bool) -> tuple[nn.Module, int]:
+    weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+    backbone = resnet50(weights=weights)
+    embedding_dim = backbone.fc.in_features
+    feature_layers = list(backbone.children())[:-1]
+    model = GlobalFeatureExtractor(nn.Sequential(*feature_layers))
+    model.eval()
+    return model, embedding_dim
+
+
+def _load_dinov2(model_name: str, pretrained: bool) -> tuple[nn.Module, int]:
+    hub_name, embedding_dim = _DINOV2_HUB_NAMES[model_name]
+    if not pretrained:
+        raise ValueError("DINOv2 backbones only ship with pretrained weights.")
+    # ``torch.hub.load`` caches the checkpoint under ~/.cache/torch/hub/.
+    # ``trust_repo=True`` skips the y/n prompt on first run.
+    backbone = torch.hub.load(
+        "facebookresearch/dinov2",
+        hub_name,
+        trust_repo=True,
+        verbose=False,
+    )
+    backbone.eval()
+    model = DinoV2FeatureExtractor(backbone)
+    model.eval()
+    return model, embedding_dim
+
+
 def get_feature_extractor(
     model_name: str = "resnet50",
     pretrained: bool = True,
 ) -> tuple[nn.Module, int]:
     model_name = model_name.lower()
 
-    if model_name != "resnet50":
-        raise ValueError(
-            f"Unsupported model '{model_name}'. Available options: ['resnet50']"
-        )
+    if model_name == "resnet50":
+        return _load_resnet50(pretrained)
 
-    weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
-    backbone = resnet50(weights=weights)
-    embedding_dim = backbone.fc.in_features
-    feature_layers = list(backbone.children())[:-1]
+    if model_name in _DINOV2_HUB_NAMES:
+        return _load_dinov2(model_name, pretrained)
 
-    model = GlobalFeatureExtractor(nn.Sequential(*feature_layers))
-    model.eval()
-    return model, embedding_dim
+    available = ["resnet50", *sorted(_DINOV2_HUB_NAMES)]
+    raise ValueError(
+        f"Unsupported model '{model_name}'. Available options: {available}"
+    )
