@@ -1,0 +1,26 @@
+{
+  "resnet50": {
+    "top_1_accuracy": 0.46825396825396826,
+    "top_5_accuracy": 0.6924603174603174,
+    "mAP": 0.5258680555555556,
+    "pipeline_seconds": 337.8
+  },
+  "dinov2_vits14": {
+    "top_1_accuracy": 0.49206349206349204,
+    "top_5_accuracy": 0.748015873015873,
+    "mAP": 0.5587218915343914,
+    "pipeline_seconds": 371.5
+  },
+  "dinov2_vitb14": {
+    "top_1_accuracy": 0.49404761904761907,
+    "top_5_accuracy": 0.7242063492063492,
+    "mAP": 0.5596119929453263,
+    "pipeline_seconds": 1050.7
+  },
+  "dinov2_vits14_hires": {
+    "top_1_accuracy": 0.5277777777777778,
+    "top_5_accuracy": 0.7202380952380952,
+    "mAP": 0.5772018298059964,
+    "pipeline_seconds": null
+  }
+}

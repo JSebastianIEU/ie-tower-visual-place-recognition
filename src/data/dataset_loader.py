@@ -17,10 +17,13 @@ class ImagePlaceDataset(Dataset):
         csv_path: str | Path,
         image_root: str | Path | None = None,
         transform: Optional[Callable] = None,
+        split_filter: Optional[str] = None,
+        skip_missing: bool = False,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.image_root = Path(image_root) if image_root is not None else None
         self.transform = transform
+        self.split_filter = split_filter
 
         self.data = pd.read_csv(self.csv_path)
         missing_columns = REQUIRED_COLUMNS - set(self.data.columns)
@@ -28,6 +31,29 @@ class ImagePlaceDataset(Dataset):
             raise ValueError(
                 f"Dataset CSV is missing required columns: {sorted(missing_columns)}"
             )
+
+        # Optional split filtering: when the caller asks for a specific split
+        # (e.g. "gallery") and the column exists with at least one matching row,
+        # we keep only those rows. If the column is absent or has no matches we
+        # silently keep every row so legacy CSVs without splits keep working.
+        if split_filter is not None and "split" in self.data.columns:
+            mask = self.data["split"].fillna("").astype(str) == split_filter
+            if mask.any():
+                self.data = self.data.loc[mask].reset_index(drop=True)
+
+        # Optionally drop rows whose image_path does not resolve to an existing
+        # file. Useful when running the pipeline on a partially-populated repo
+        # (e.g. Ariel's floor10-16 rows but his frames were never committed).
+        if skip_missing:
+            existing_mask = self.data["image_path"].astype(str).apply(
+                lambda p: self._resolve_image_path(p).exists()
+            )
+            dropped = (~existing_mask).sum()
+            if dropped:
+                print(
+                    f"[dataset] skipping {dropped} row(s) with missing image files."
+                )
+            self.data = self.data.loc[existing_mask].reset_index(drop=True)
 
         self.extra_columns = [
             column for column in self.data.columns if column not in REQUIRED_COLUMNS
