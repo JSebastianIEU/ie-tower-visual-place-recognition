@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Re-run every stage, ignoring auto-skip detection.",
     )
-    for stage in ("sync", "extract", "splits", "pipeline", "eval"):
+    for stage in ("sync", "extract", "annotate", "splits", "pipeline", "eval"):
         parser.add_argument(
             f"--force-{stage}",
             action="store_true",
@@ -186,6 +186,25 @@ def needs_extract() -> tuple[bool, str]:
     )
 
 
+def needs_annotate() -> tuple[bool, str]:
+    """Skip if every CSV row already has area / section / floor_range filled."""
+    if not DEFAULT_DATASET_CSV.exists():
+        return True, "dataset.csv does not exist yet."
+    df = pd.read_csv(DEFAULT_DATASET_CSV)
+    needed_columns = ("area", "section", "floor_range")
+    missing = [c for c in needed_columns if c not in df.columns]
+    if missing:
+        return True, f"columns missing: {', '.join(missing)}."
+    empty = 0
+    for column in needed_columns:
+        empty += df[column].fillna("").astype(str).eq("").sum()
+    if empty == 0:
+        return False, (
+            f"every one of {len(df)} rows already has area / section / floor_range."
+        )
+    return True, f"{empty} cells still empty across area / section / floor_range."
+
+
 def needs_splits() -> tuple[bool, str]:
     if not DEFAULT_DATASET_CSV.exists():
         return True, "dataset.csv does not exist yet."
@@ -246,7 +265,7 @@ def main() -> None:
 
     maybe_run(
         "sync",
-        "1/5 SYNC raw videos from Drive",
+        "1/6 SYNC raw videos from Drive",
         [python, str(SCRIPTS_DIR / "sync_drive_data.py"), "--no-strict"],
         needs_fn=lambda: needs_sync(args.min_videos),
         force=args.force,
@@ -255,7 +274,7 @@ def main() -> None:
     )
     maybe_run(
         "extract",
-        "2/5 EXTRACT frames + update CSV",
+        "2/6 EXTRACT frames + update CSV",
         [python, str(SCRIPTS_DIR / "extract_frames_and_update_csv.py")],
         needs_fn=needs_extract,
         force=args.force,
@@ -263,8 +282,17 @@ def main() -> None:
         force_stage=args.force_extract,
     )
     maybe_run(
+        "annotate",
+        "3/6 ANNOTATE area / section / floor_range",
+        [python, str(SCRIPTS_DIR / "annotate_hierarchy.py")],
+        needs_fn=needs_annotate,
+        force=args.force,
+        skip=args.skip_annotate,
+        force_stage=args.force_annotate,
+    )
+    maybe_run(
         "splits",
-        "3/5 ASSIGN gallery / query splits",
+        "4/6 ASSIGN gallery / query splits",
         [python, str(SCRIPTS_DIR / "assign_splits.py")],
         needs_fn=needs_splits,
         force=args.force,
@@ -273,7 +301,7 @@ def main() -> None:
     )
     maybe_run(
         "pipeline",
-        "4/5 EXTRACT embeddings + BUILD FAISS index",
+        "5/6 EXTRACT embeddings + BUILD FAISS index",
         [python, str(SCRIPTS_DIR / "run_pipeline.py")],
         needs_fn=needs_pipeline,
         force=args.force,
@@ -282,7 +310,7 @@ def main() -> None:
     )
     maybe_run(
         "eval",
-        "5/5 EVALUATE retrieval quality",
+        "6/6 EVALUATE retrieval quality",
         [python, str(SCRIPTS_DIR / "run_evaluation.py")],
         needs_fn=needs_eval,
         force=args.force,
