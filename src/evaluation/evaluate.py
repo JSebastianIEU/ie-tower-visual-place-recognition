@@ -3,8 +3,10 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from src.evaluation.hierarchical_metrics import evaluate_hierarchical
 from src.evaluation.metrics import mean_average_precision, top_k_accuracy
 from src.retrieval.build_index import build_faiss_index
+from src.retrieval.hierarchical import DEFAULT_CONFIDENCE_THRESHOLD
 from src.retrieval.search import search_index
 
 
@@ -15,6 +17,7 @@ def evaluate_retrieval(
     query_metadata: pd.DataFrame | None = None,
     top_ks: Iterable[int] = (1, 5),
     metric: str = "cosine",
+    hierarchical_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> dict:
     gallery_metadata = gallery_metadata.reset_index(drop=True)
     same_gallery = query_embeddings is None and query_metadata is None
@@ -103,4 +106,23 @@ def evaluate_retrieval(
     metrics["per_class"] = per_class
     metrics["confusion_top_misses"] = confusion
     metrics["num_queries"] = len(ground_truth_labels)
+
+    # ---- Hierarchical / 4-tier metrics -----------------------------------
+    # Only meaningful when the metadata exposes the hierarchy columns
+    # produced by scripts/annotate_hierarchy.py. Skipped for legacy CSVs
+    # so the existing top-K numbers are unchanged for old runs.
+    has_hierarchy = all(
+        column in query_metadata.columns
+        for column in ("floor_range", "section", "area")
+    )
+    if has_hierarchy:
+        metrics["hierarchical"] = evaluate_hierarchical(
+            gallery_embeddings=gallery_embeddings,
+            gallery_metadata=gallery_metadata,
+            query_embeddings=query_embeddings,
+            query_metadata=query_metadata,
+            top_ks=top_ks,
+            metric=metric,
+            threshold=hierarchical_threshold,
+        )
     return metrics

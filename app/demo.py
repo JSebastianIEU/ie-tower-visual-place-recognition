@@ -44,11 +44,16 @@ def _():
     from src.features.models import get_feature_extractor, resolve_device
     from src.features.transforms import get_image_transform
     from src.retrieval.faiss_utils import load_index
+    from src.retrieval.hierarchical import (
+        DEFAULT_CONFIDENCE_THRESHOLD,
+        hierarchical_predict,
+    )
     from src.retrieval.search import search_index
     from src.utils.config import EMBEDDINGS_DIR, INDEX_DIR, RESULTS_DIR, ROOT
 
     return (
         Counter,
+        DEFAULT_CONFIDENCE_THRESHOLD,
         EMBEDDINGS_DIR,
         INDEX_DIR,
         Image,
@@ -62,6 +67,7 @@ def _():
         extract_pil_image_embedding,
         get_feature_extractor,
         get_image_transform,
+        hierarchical_predict,
         io,
         json,
         load_index,
@@ -222,6 +228,88 @@ def _(Counter, Image, ImageOps, Path, base64, escape, io, mimetypes):
             f"(confidence {votes}/{total} ≈ {confidence:.0%}) — {tag}</span></div>"
         )
 
+    def render_tier_card(prediction, ground_truth=None):
+        """Render the 4-tier hierarchical prediction as a card.
+
+        ``prediction`` is the dict returned by
+        ``src.retrieval.hierarchical.hierarchical_predict``. Each row of
+        the card shows one tier (floor / floor_range / section / area).
+        The selected tier is highlighted in green; the others are faded
+        so the user can see the model "stepping down".
+        """
+        if not prediction or not prediction.get("best"):
+            return (
+                '<div style="padding:14px;border-radius:12px;background:#fef3c7;'
+                'color:#92400e;font-size:14px;">No prediction available.</div>'
+            )
+        selected_level = prediction.get("selected_level")
+        threshold = prediction.get("threshold", 0.6)
+        chain = prediction.get("fallback_chain", [])
+
+        rows_html = []
+        level_pretty = {
+            "floor":       "Exact floor",
+            "floor_range": "Floor range",
+            "section":     "Section",
+            "area":        "Area type",
+        }
+        for entry in chain:
+            level = entry["level"]
+            label = entry.get("label") or "—"
+            votes = entry.get("votes", 0)
+            k = entry.get("k", 0)
+            ratio = entry.get("ratio", 0.0)
+            is_selected = level == selected_level
+
+            # Colour-code per row: selected = green; others muted; if we
+            # have ground truth, mark the row that matches it.
+            truth_match = (
+                ground_truth is not None
+                and label != "—"
+                and label == ground_truth
+            )
+            if is_selected and truth_match:
+                row_bg, row_border, row_fg = "#ecfdf5", "#10b981", "#065f46"
+                badge = "✓ correct (selected)"
+            elif is_selected and ground_truth is not None:
+                row_bg, row_border, row_fg = "#fef2f2", "#ef4444", "#991b1b"
+                badge = "✗ wrong (selected)"
+            elif is_selected:
+                row_bg, row_border, row_fg = "#eff6ff", "#1d4ed8", "#1e3a8a"
+                badge = "← selected"
+            elif truth_match:
+                row_bg, row_border, row_fg = "#f0fdf4", "#86efac", "#166534"
+                badge = "matches truth"
+            else:
+                row_bg, row_border, row_fg = "#f9fafb", "#e5e7eb", "#6b7280"
+                badge = ""
+
+            ratio_pct = f"{ratio:.0%}"
+            rows_html.append(
+                f'<div style="display:grid;grid-template-columns:160px 1fr 90px 110px;'
+                f'gap:8px;align-items:center;padding:10px 14px;background:{row_bg};'
+                f'border:1px solid {row_border};border-radius:10px;color:{row_fg};">'
+                f'<div style="font-size:12px;text-transform:uppercase;'
+                f'letter-spacing:0.04em;color:{row_fg};opacity:0.85;">{level_pretty[level]}</div>'
+                f'<div style="font-size:16px;font-weight:600;">{escape(label)}</div>'
+                f'<div style="font-size:13px;text-align:right;">{votes}/{k}</div>'
+                f'<div style="font-size:13px;text-align:right;font-weight:600;">{ratio_pct}'
+                f'<span style="font-size:11px;font-weight:400;opacity:0.85;"> {badge}</span></div>'
+                f'</div>'
+            )
+        threshold_note = (
+            f'<div style="font-size:12px;color:#6b7280;margin-top:8px;">'
+            f"Selected tier = the most-specific level with confidence ratio ≥ {threshold:.0%}. "
+            "Faded rows are shown so you can see what the model would have answered at each level."
+            f"</div>"
+        )
+        return (
+            '<div style="display:flex;flex-direction:column;gap:8px;">'
+            + "".join(rows_html)
+            + threshold_note
+            + "</div>"
+        )
+
     def render_query_preview(mo_module, image, data_uri, ground_truth=None):
         gt_html = ""
         if ground_truth is not None:
@@ -242,6 +330,7 @@ def _(Counter, Image, ImageOps, Path, base64, escape, io, mimetypes):
         render_prediction_banner,
         render_query_preview,
         render_result_card,
+        render_tier_card,
         summarize_prediction,
     )
 
@@ -1017,6 +1106,9 @@ def _(
 
 @app.cell(hide_code=True)
 def _(
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    hierarchical_predict,
+    metadata,
     mo,
     path_to_data_uri,
     query_data_uri,
@@ -1026,6 +1118,7 @@ def _(
     render_prediction_banner,
     render_query_preview,
     render_result_card,
+    render_tier_card,
     results,
     summarize_prediction,
 ):
@@ -1034,7 +1127,44 @@ def _(
     elif results is None or len(results) == 0:
         search_view = mo.md("## No results — the index returned nothing for this query.")
     else:
-        predicted, votes, total = summarize_prediction(results)
+        # The hierarchical predictor runs whenever the gallery metadata
+        # carries the area / section / floor_range columns produced by
+        # scripts/annotate_hierarchy.py. Otherwise we fall back to the
+        # original single-line prediction banner so legacy galleries
+        # still render.
+        has_hierarchy = (
+            metadata is not None
+            and {"area", "section", "floor_range"}.issubset(set(metadata.columns))
+        )
+
+        if has_hierarchy:
+            prediction = hierarchical_predict(
+                results, threshold=DEFAULT_CONFIDENCE_THRESHOLD
+            )
+            prediction_block = mo.vstack(
+                [
+                    mo.md("### Hierarchical prediction"),
+                    mo.md(
+                        "The model picks the **most specific** tier whose "
+                        "Top-K vote ratio is at least 60 %. Faded rows show "
+                        "what it would have answered at every other tier."
+                    ),
+                    mo.Html(render_tier_card(prediction, query_ground_truth)),
+                ]
+            )
+        else:
+            predicted, votes, total = summarize_prediction(results)
+            prediction_block = mo.vstack(
+                [
+                    mo.md("### Prediction"),
+                    mo.Html(
+                        render_prediction_banner(
+                            predicted, votes, total, query_ground_truth
+                        )
+                    ),
+                ]
+            )
+
         cards = [
             render_result_card(
                 rank=r.rank,
@@ -1051,8 +1181,7 @@ def _(
             [
                 mo.md("### Query preview"),
                 render_query_preview(mo, query_image, query_data_uri, query_ground_truth),
-                mo.md("### Prediction"),
-                mo.Html(render_prediction_banner(predicted, votes, total, query_ground_truth)),
+                prediction_block,
                 mo.md("### Top-K results"),
                 mo.Html(
                     f'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;">'

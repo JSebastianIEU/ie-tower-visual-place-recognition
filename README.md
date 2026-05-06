@@ -30,11 +30,12 @@ flowchart TD
     A["Team Google Drive<br/>raw .mov uploads"] -->|"sync_drive_data.py"| B["data/raw_videos/<br/>fNN_area_descriptor.mov"]
     B -->|"extract_frames_and_update_csv.py<br/>ffmpeg at 1 FPS"| C["data/processed_frames/floorN/<br/>JPEG frames"]
     C -->|"appends one row per frame"| D["data/metadata/dataset.csv"]
-    D -->|"assign_splits.py<br/>deterministic stride"| E["dataset.csv with<br/>gallery / query split column"]
-    E -->|"run_pipeline.py<br/>ResNet50 frozen + FAISS"| F["outputs/embeddings/<br/>gallery_embeddings.npy<br/>gallery_metadata.csv"]
+    D -->|"annotate_hierarchy.py<br/>fills area / section / floor_range"| D2["dataset.csv with<br/>hierarchy columns"]
+    D2 -->|"assign_splits.py<br/>deterministic stride"| E["dataset.csv with<br/>gallery / query split column"]
+    E -->|"run_pipeline.py<br/>DINOv2 frozen + FAISS"| F["outputs/embeddings/<br/>gallery_embeddings.npy<br/>gallery_metadata.csv"]
     F --> G["outputs/index/<br/>gallery.index"]
-    G -->|"run_evaluation.py<br/>Top-K accuracy + mAP"| H["outputs/results/<br/>evaluation.json"]
-    G -->|"marimo edit app/demo.py<br/>or notebooks/test_model.ipynb"| I["Predicted floor<br/>+ Top-K gallery thumbnails"]
+    G -->|"run_evaluation.py<br/>Top-K + mAP + 4-tier metrics"| H["outputs/results/<br/>evaluation.json"]
+    G -->|"marimo edit app/demo.py<br/>or notebooks/test_model.ipynb"| I["4-tier prediction<br/>+ Top-K gallery thumbnails"]
 ```
 
 `scripts/run_all.py` is a thin wrapper that runs every stage in order and **auto-skips** stages whose output is already on disk and up to date. Each individual stage script is also idempotent on its own — re-running any of them does not duplicate rows, re-download files, or rebuild anything already in sync.
@@ -55,17 +56,18 @@ marimo edit app/demo.py                                # Marimo web app
 jupyter notebook notebooks/test_model.ipynb           # Jupyter notebook
 ```
 
-That's it. `run_all.py` orchestrates 5 stages and **detects what is already done** so a second run is essentially instantaneous:
+That's it. `run_all.py` orchestrates 6 stages and **detects what is already done** so a second run is essentially instantaneous:
 
 | Stage | What it does | Skip condition |
 |---|---|---|
 | 1. SYNC | `gdown` the Drive folder into `data/raw_videos/` and rename every legacy upload to the canonical `fNN_<area>_<descriptor>.<ext>`. | `data/raw_videos/` already has at least 10 canonical videos. |
 | 2. EXTRACT | Run ffmpeg at 1 FPS over every video, write JPEGs to `data/processed_frames/floorN/`, append rows to `data/metadata/dataset.csv`. | Every video in `data/raw_videos/` already has frames on disk. |
-| 3. SPLITS | Populate `dataset.csv`'s `split` column with a deterministic stride-based gallery / query partition. | Every CSV row already has a non-empty `split`. |
-| 4. PIPELINE | Extract ResNet50 embeddings, save them, and build a FAISS Flat-IP index. | `gallery_embeddings.npy`, `gallery_metadata.csv`, and `gallery.index` all exist. |
-| 5. EVAL | Compute Top-1 / Top-5 accuracy and mAP, write `outputs/results/evaluation.json`. | `evaluation.json` already exists. |
+| 3. ANNOTATE | Populate `area`, `section` and `floor_range` columns on `dataset.csv` from each frame's filename and label. Feeds the four-tier hierarchical predictor. | Every row already has those three columns filled. |
+| 4. SPLITS | Populate `dataset.csv`'s `split` column with a deterministic stride-based gallery / query partition. | Every CSV row already has a non-empty `split`. |
+| 5. PIPELINE | Extract ResNet50 / DINOv2 embeddings, save them, and build a FAISS Flat-IP index. | `gallery_embeddings.npy`, `gallery_metadata.csv`, and `gallery.index` all exist. |
+| 6. EVAL | Compute Top-1 / Top-5 accuracy and mAP plus the hierarchical metric block, write `outputs/results/evaluation.json`. | `evaluation.json` already exists. |
 
-**Force a re-run** of one stage with `--force-sync`, `--force-extract`, `--force-splits`, `--force-pipeline`, or `--force-eval`. Force everything with `--force`. Skip a stage entirely (e.g. offline) with `--skip-sync` and friends.
+**Force a re-run** of one stage with `--force-sync`, `--force-extract`, `--force-annotate`, `--force-splits`, `--force-pipeline`, or `--force-eval`. Force everything with `--force`. Skip a stage entirely (e.g. offline) with `--skip-sync` and friends.
 
 ### Standalone stage scripts (advanced)
 
@@ -316,9 +318,43 @@ Where we are on the full 25-label dataset (DINOv2 ViT-S at 518×518): **52.8 % T
 - **EXIF rotation** is already handled in `app/demo.py` and `notebooks/test_model.ipynb` via `ImageOps.exif_transpose`. If you build a new entry point, remember to do the same — otherwise iPhone uploads come in sideways and the prediction collapses.
 - **Disk usage.** ~2.9 k JPEGs (~120 MB) committed under `data/processed_frames/`. Embeddings + FAISS index together stay below 50 MB and are gitignored.
 
+### Hierarchical / progressive-specificity prediction
+
+The model often *almost* gets the floor right — it lands on the correct floor range but is split between two adjacent floors. Returning a confidently-wrong floor in that case is much worse for the user than admitting "you're somewhere on the mid-rise levels". The pipeline now produces a **four-tier prediction** per query and surfaces the most-specific tier whose Top-K vote ratio meets the confidence threshold (default 0.6).
+
+The tiers, from most to least specific:
+
+| Tier | Example label | When the model selects it |
+|---|---|---|
+| 1. Exact floor | `floor10`, `basement3` | The Top-K matches agree on a single floor (≥3 of 5 by default). |
+| 2. Floor range | `lowrise` (3–9), `midrise` (10–16), `highrise` (17–23), `basement` | The matches disagree on the exact floor but cluster within a single range. |
+| 3. Section | `above-ground`, `basement` | Even the range is unclear, but at least the model knows which half of the building. |
+| 4. Area type | `hallway`, `elevator`, `stairs`, `classroom`, `chill_lounge`, … | Vertical location is ambiguous; the model can only say what *kind of space* the photo shows. |
+
+**Schema.** `scripts/annotate_hierarchy.py` populates three new columns on `data/metadata/dataset.csv` derived from the canonical filename and label:
+
+* `area` — the area token from the filename (`hallway`, `elevator`, `chill_lounge`, …).
+* `section` — `above-ground` or `basement`.
+* `floor_range` — `lowrise` / `midrise` / `highrise` / `basement`.
+
+The script is idempotent and runs as stage 3 of `scripts/run_all.py`. Re-running on a fully-annotated CSV is a no-op.
+
+**API.** `src.retrieval.hierarchical.hierarchical_predict(results, threshold=0.6)` returns a typed dict with the selected tier, the full fallback chain, and the threshold used. `explain_prediction(...)` formats it as a one-line human summary. The Marimo demo renders every tier as a row (selected highlighted in blue / green-when-correct / red-when-wrong); the Jupyter notebook prints the chain inline below the Top-K thumbnails.
+
+**Metrics.** `outputs/results/evaluation.json` gains a `hierarchical` block with per-tier Top-K accuracy, `tier_resolution_rate` (fraction of queries that resolved at each tier), and `tier_when_resolved_accuracy` (accuracy of the model's answer at each tier when it chose to answer there). Held-out queries on the current production setup (DINOv2 ViT-S/14 hires, threshold 0.6):
+
+| Tier | Resolution rate | Accuracy when resolved |
+|---|---|---|
+| Exact floor | 38.5 % | 80.4 % |
+| Floor range | 44.8 % | 60.2 % |
+| Section | 16.7 % | 84.5 % |
+| Area type | 0.0 % | — |
+
+Read together: about 4 in 10 held-out queries get a confident floor-level answer (correct ~80 % of the time); the rest fall back to a coarser tier where the model is also accurate. Lowering the threshold (`hierarchical_threshold` argument to `evaluate_retrieval`) shifts more weight toward the floor tier at the cost of accuracy.
+
 ### Next-iteration roadmap
 
-Listed in expected-impact order. The plan is to merge the current configuration to `main` first (it is the best honest setup we have today), then tackle these on follow-up branches:
+The remaining ideas, in expected-impact order. PR-A (the hierarchical predictor above) has shipped; PR-B / PR-C / PR-D are next:
 
 1. **Triplet-loss fine-tuning of a projection head.** Freeze DINOv2 ViT-S, train a small 2-layer MLP on top with positive pairs = same floor and negative pairs = different floor. Re-uses the existing gallery as supervision and is cheap to run. Typical gain on similar VPR datasets: **+5–15 pp** Top-1.
 2. **Capture a second pass per floor.** Each location filmed a second time on a different day, different phone, different lighting. This is the only way to make the held-out queries honest and to break the consecutive-frame leakage. Adds work for the team, not for the model.
