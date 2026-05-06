@@ -75,4 +75,32 @@ def evaluate_retrieval(
         for k in top_ks
     }
     metrics["mAP"] = mean_average_precision(relevance_lists)
+
+    # ---- Per-class breakdown + confusion analysis ------------------------
+    # These help diagnose which labels the model is good at and which ones
+    # it confuses, without changing the headline metrics above.
+    per_class: dict[str, dict] = {}
+    confusion: dict[str, dict[str, int]] = {}
+    for gt, ranked in zip(ground_truth_labels, retrieved_labels):
+        bucket = per_class.setdefault(
+            gt,
+            {"queries": 0, "top1_correct": 0, "top5_correct": 0},
+        )
+        bucket["queries"] += 1
+        if ranked and ranked[0] == gt:
+            bucket["top1_correct"] += 1
+        if gt in ranked[:5]:
+            bucket["top5_correct"] += 1
+        if ranked and ranked[0] != gt:
+            row = confusion.setdefault(gt, {})
+            row[ranked[0]] = row.get(ranked[0], 0) + 1
+
+    for bucket in per_class.values():
+        n = bucket["queries"]
+        bucket["top1_accuracy"] = bucket["top1_correct"] / n if n else 0.0
+        bucket["top5_accuracy"] = bucket["top5_correct"] / n if n else 0.0
+
+    metrics["per_class"] = per_class
+    metrics["confusion_top_misses"] = confusion
+    metrics["num_queries"] = len(ground_truth_labels)
     return metrics

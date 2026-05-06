@@ -204,13 +204,25 @@ marimo/_lsp/
 __marimo__/
 
 # Project artifacts
+# Raw videos are large (~3 GB) and live only in the team Drive — never commit.
 data/raw_videos/*
 !data/raw_videos/.gitkeep
-data/processed_frames/*
-!data/processed_frames/.gitkeep
+# Processed frames ARE committed: the team agreed to version them so anyone
+# who clones the repo can run the pipeline without re-downloading from Drive.
+# Total ~1-2 GB of small JPEGs. (Re-add the two lines below to opt out.)
+# data/processed_frames/*
+# !data/processed_frames/.gitkeep
+# Outputs (embeddings, FAISS index, eval JSON) are reproducible from frames +
+# scripts, so we keep them out of git to avoid bloat.
 outputs/embeddings/*
 !outputs/embeddings/.gitkeep
 outputs/index/*
 !outputs/index/.gitkeep
 outputs/results/*
 !outputs/results/.gitkeep
+.claude/
+
+# Backbone-comparison artifacts. comparison.json is committed; the
+# embeddings/index/eval blobs under each backbone subdir are gitignored.
+outputs/_compare/*
+!outputs/_compare/comparison.json
