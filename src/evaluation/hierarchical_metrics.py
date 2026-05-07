@@ -117,9 +117,11 @@ def evaluate_hierarchical(
         for k, value in per_k.items():
             metrics[f"top_{k}_{level}_accuracy"] = value
 
-    # Tier resolution + per-tier when-resolved accuracy.
-    tier_counts = {"floor": 0, "floor_range": 0, "section": 0, "area": 0}
-    tier_correct = {"floor": 0, "floor_range": 0, "section": 0, "area": 0}
+    # Spatial-tier resolution + per-tier when-resolved accuracy.
+    spatial_tiers = ("floor", "floor_range", "section")
+    tier_counts = {level: 0 for level in spatial_tiers}
+    tier_correct = {level: 0 for level in spatial_tiers}
+    area_tag_counts = {"correct": 0, "considered": 0}
     total_resolved = 0
     for results, (_, query_row) in zip(ranked, query_metadata.iterrows()):
         prediction = hierarchical_predict(results, threshold=threshold)
@@ -130,23 +132,41 @@ def evaluate_hierarchical(
         tier_counts[level] += 1
         total_resolved += 1
         truth_field = "label" if level == "floor" else level
-        if truth_field not in query_metadata.columns:
-            continue
-        truth_value = query_row.get(truth_field)
-        truth_value = (
-            str(truth_value).strip() if pd.notna(truth_value) else ""
-        )
-        if truth_value and best.get("label") == truth_value:
-            tier_correct[level] += 1
+        if truth_field in query_metadata.columns:
+            truth_value = query_row.get(truth_field)
+            truth_value = (
+                str(truth_value).strip() if pd.notna(truth_value) else ""
+            )
+            if truth_value and best.get("label") == truth_value:
+                tier_correct[level] += 1
+
+        # Area tag is independent — track separately.
+        area_tag = prediction.get("area_tag") or {}
+        area_label = area_tag.get("label")
+        if area_label and "area" in query_metadata.columns:
+            area_tag_counts["considered"] += 1
+            truth_area = query_row.get("area")
+            truth_area = (
+                str(truth_area).strip() if pd.notna(truth_area) else ""
+            )
+            if truth_area and area_label == truth_area:
+                area_tag_counts["correct"] += 1
 
     metrics["tier_resolution_rate"] = {
         level: (tier_counts[level] / total_resolved if total_resolved else 0.0)
-        for level in tier_counts
+        for level in spatial_tiers
     }
     metrics["tier_when_resolved_accuracy"] = {
         level: (tier_correct[level] / tier_counts[level] if tier_counts[level] else 0.0)
-        for level in tier_counts
+        for level in spatial_tiers
     }
+    metrics["area_tag_accuracy"] = (
+        area_tag_counts["correct"] / area_tag_counts["considered"]
+        if area_tag_counts["considered"] else 0.0
+    )
+    metrics["area_tag_coverage"] = (
+        area_tag_counts["considered"] / total_resolved if total_resolved else 0.0
+    )
     metrics["confidence_threshold"] = threshold
     metrics["num_queries"] = len(query_metadata)
     return metrics
