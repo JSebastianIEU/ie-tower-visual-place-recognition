@@ -42,6 +42,7 @@ def _():
 
     from src.features.extract_embeddings import extract_pil_image_embedding
     from src.features.models import get_feature_extractor, resolve_device
+    from src.features.ocr_predictor import OCRFloorPredictor
     from src.features.transforms import get_image_transform
     from src.retrieval.faiss_utils import load_index
     from src.retrieval.hierarchical import (
@@ -58,6 +59,7 @@ def _():
         INDEX_DIR,
         Image,
         ImageOps,
+        OCRFloorPredictor,
         Path,
         PROJECT_ROOT,
         RESULTS_DIR,
@@ -228,14 +230,20 @@ def _(Counter, Image, ImageOps, Path, base64, escape, io, mimetypes):
             f"(confidence {votes}/{total} ≈ {confidence:.0%}) — {tag}</span></div>"
         )
 
-    def render_tier_card(prediction, ground_truth=None):
-        """Render the 4-tier hierarchical prediction as a card.
+    def render_tier_card(prediction, ground_truth=None, ground_truth_area=None):
+        """Render the hierarchical prediction as a card.
 
         ``prediction`` is the dict returned by
-        ``src.retrieval.hierarchical.hierarchical_predict``. Each row of
-        the card shows one tier (floor / floor_range / section / area).
-        The selected tier is highlighted in green; the others are faded
-        so the user can see the model "stepping down".
+        ``src.retrieval.hierarchical.hierarchical_predict``. The card has
+        two parts:
+
+        * A spatial fallback chain (floor → floor_range → section), one
+          row per tier. The selected tier is highlighted; the others are
+          faded so the user can see the model "stepping down".
+        * An orthogonal area tag rendered as a chip under the chain.
+          ``area`` answers "what kind of space is this?" and is shown
+          alongside whichever spatial tier was selected, not as a step
+          down from section.
         """
         if not prediction or not prediction.get("best"):
             return (
@@ -245,13 +253,13 @@ def _(Counter, Image, ImageOps, Path, base64, escape, io, mimetypes):
         selected_level = prediction.get("selected_level")
         threshold = prediction.get("threshold", 0.6)
         chain = prediction.get("fallback_chain", [])
+        area_tag = prediction.get("area_tag") or {}
 
         rows_html = []
         level_pretty = {
             "floor":       "Exact floor",
             "floor_range": "Floor range",
             "section":     "Section",
-            "area":        "Area type",
         }
         for entry in chain:
             level = entry["level"]
@@ -261,8 +269,6 @@ def _(Counter, Image, ImageOps, Path, base64, escape, io, mimetypes):
             ratio = entry.get("ratio", 0.0)
             is_selected = level == selected_level
 
-            # Colour-code per row: selected = green; others muted; if we
-            # have ground truth, mark the row that matches it.
             truth_match = (
                 ground_truth is not None
                 and label != "—"
@@ -297,15 +303,53 @@ def _(Counter, Image, ImageOps, Path, base64, escape, io, mimetypes):
                 f'<span style="font-size:11px;font-weight:400;opacity:0.85;"> {badge}</span></div>'
                 f'</div>'
             )
+
+        # Area tag chip — orthogonal label, not part of the spatial chain.
+        area_html = ""
+        area_label = area_tag.get("label")
+        if area_label:
+            area_votes = area_tag.get("votes", 0)
+            area_k = area_tag.get("k", 0)
+            area_ratio = area_tag.get("ratio", 0.0)
+            area_truth_match = (
+                ground_truth_area is not None
+                and ground_truth_area
+                and area_label == ground_truth_area
+            )
+            if ground_truth_area is not None:
+                if area_truth_match:
+                    chip_bg, chip_fg, chip_border = "#ecfdf5", "#065f46", "#6ee7b7"
+                    chip_tag = "✓ matches truth"
+                else:
+                    chip_bg, chip_fg, chip_border = "#fef2f2", "#991b1b", "#fca5a5"
+                    chip_tag = f"✗ true area: {escape(ground_truth_area)}"
+            else:
+                chip_bg, chip_fg, chip_border = "#fef9c3", "#854d0e", "#fde68a"
+                chip_tag = ""
+            area_html = (
+                f'<div style="margin-top:4px;display:flex;align-items:center;gap:8px;'
+                f'padding:10px 14px;background:{chip_bg};border:1px solid {chip_border};'
+                f'border-radius:10px;color:{chip_fg};font-size:14px;">'
+                f'<span style="font-size:12px;text-transform:uppercase;letter-spacing:0.04em;'
+                f'opacity:0.85;">Area type</span>'
+                f'<span style="font-weight:600;">{escape(area_label)}</span>'
+                f'<span style="opacity:0.85;font-size:12px;">'
+                f'  ·  {area_votes}/{area_k} matches ({area_ratio:.0%})'
+                f"{('  ·  ' + chip_tag) if chip_tag else ''}"
+                f'</span></div>'
+            )
+
         threshold_note = (
             f'<div style="font-size:12px;color:#6b7280;margin-top:8px;">'
-            f"Selected tier = the most-specific level with confidence ratio ≥ {threshold:.0%}. "
-            "Faded rows are shown so you can see what the model would have answered at each level."
+            f"Spatial tier = most-specific level with confidence ratio ≥ {threshold:.0%}. "
+            "The area chip shows what *kind* of space the model thinks the photo is, "
+            "always rendered (orthogonal to the vertical hierarchy)."
             f"</div>"
         )
         return (
             '<div style="display:flex;flex-direction:column;gap:8px;">'
             + "".join(rows_html)
+            + area_html
             + threshold_note
             + "</div>"
         )
@@ -960,7 +1004,7 @@ def _(metadata, mo):
     # --- Section 2: Query controls -----------------------------------------
     if metadata is None:
         controls_view = None
-        upload = top_k = metric = random_button = None
+        upload = top_k = metric = random_button = ocr_toggle = None
     else:
         upload = mo.ui.file(label="Upload a query image (JPG/PNG)", multiple=False)
         random_button = mo.ui.run_button(
@@ -970,25 +1014,62 @@ def _(metadata, mo):
         metric = mo.ui.dropdown(
             options=["cosine", "l2"], value="cosine", label="Search metric"
         )
+        ocr_toggle = mo.ui.checkbox(
+            value=True,
+            label="Use OCR (read floor numbers from the photo when visible)",
+        )
         controls_view = mo.vstack(
             [
                 mo.md("## 2. Test the model"),
                 mo.md(
                     "Two options: drag a photo into the upload widget, OR press the "
                     "random button to test against a frame the model has never seen "
-                    "during indexing."
+                    "during indexing. Toggle the OCR option to short-circuit the "
+                    "prediction whenever a floor number is visible in the photo."
                 ),
                 mo.hstack([upload, random_button], gap=2),
-                mo.hstack([top_k, metric], gap=2),
+                mo.hstack([top_k, metric, ocr_toggle], gap=2),
             ]
         )
-    return controls_view, metric, random_button, top_k, upload
+    return controls_view, metric, ocr_toggle, random_button, top_k, upload
 
 
 @app.cell(hide_code=True)
 def _(controls_view):
     controls_view
     return
+
+
+@app.cell
+def _(OCRFloorPredictor, metadata):
+    # Lazy-build the OCR predictor with the gallery's known label set.
+    # easyocr only loads its weights on the first call to predict(), so
+    # this cell is cheap until the user actually toggles OCR on and runs
+    # a query.
+    if metadata is None:
+        ocr_predictor = None
+    else:
+        ocr_predictor = OCRFloorPredictor(
+            known_labels=set(metadata["label"].astype(str).unique()),
+            confidence_threshold=0.6,
+        )
+    return (ocr_predictor,)
+
+
+@app.cell
+def _(ocr_predictor, ocr_toggle, query_image):
+    # Run OCR on the active query if the toggle is on. Skips silently
+    # when no query yet, when the toggle is off, or when easyocr isn't
+    # installed.
+    ocr_result = None
+    if (
+        query_image is not None
+        and ocr_predictor is not None
+        and ocr_toggle is not None
+        and ocr_toggle.value
+    ):
+        ocr_result = ocr_predictor.predict(query_image)
+    return (ocr_result,)
 
 
 @app.cell
@@ -1010,6 +1091,7 @@ def _(
     query_bytes = None
     query_filename = "query.jpg"
     query_ground_truth = None
+    query_ground_truth_area = None
     query_status = None
 
     if metadata is None:
@@ -1034,6 +1116,10 @@ def _(
             seed = int(random_button.value)
             row = query_pool.sample(1, random_state=seed).iloc[0]
             query_ground_truth = str(row["label"])
+            if "area" in row.index:
+                area_val = row.get("area")
+                if pd.notna(area_val) and str(area_val).strip():
+                    query_ground_truth_area = str(area_val).strip()
             image_path = Path(row["image_path"])
             for candidate in (
                 image_path,
@@ -1066,6 +1152,7 @@ def _(
         query_data_uri,
         query_filename,
         query_ground_truth,
+        query_ground_truth_area,
         query_image,
         query_status,
     )
@@ -1107,12 +1194,15 @@ def _(
 @app.cell(hide_code=True)
 def _(
     DEFAULT_CONFIDENCE_THRESHOLD,
+    escape,
     hierarchical_predict,
     metadata,
     mo,
+    ocr_result,
     path_to_data_uri,
     query_data_uri,
     query_ground_truth,
+    query_ground_truth_area,
     query_image,
     query_status,
     render_prediction_banner,
@@ -1141,17 +1231,90 @@ def _(
             prediction = hierarchical_predict(
                 results, threshold=DEFAULT_CONFIDENCE_THRESHOLD
             )
-            prediction_block = mo.vstack(
-                [
-                    mo.md("### Hierarchical prediction"),
-                    mo.md(
-                        "The model picks the **most specific** tier whose "
-                        "Top-K vote ratio is at least 60 %. Faded rows show "
-                        "what it would have answered at every other tier."
-                    ),
-                    mo.Html(render_tier_card(prediction, query_ground_truth)),
-                ]
-            )
+
+            # OCR override: if the toggle is on and easyocr returned a
+            # confident floor that is also covered by the gallery, snap
+            # the selected tier to the floor that OCR read. We never
+            # invent a label OCR didn't see — only re-route to the
+            # exact-floor tier with the OCR-read label.
+            ocr_banner_html = None
+            if (
+                ocr_result is not None
+                and ocr_result.label is not None
+                and ocr_result.confidence >= 0.6
+            ):
+                # Force-promote the OCR floor to the selected tier.
+                forced = {
+                    "level": "floor",
+                    "label": ocr_result.label,
+                    "votes": prediction["fallback_chain"][0].get("votes", 0),
+                    "k": prediction["fallback_chain"][0].get("k", 0),
+                    "ratio": ocr_result.confidence,
+                    "human_level": "exact floor (OCR-confirmed)",
+                }
+                prediction = {
+                    **prediction,
+                    "best": forced,
+                    "selected_level": "floor",
+                    "ocr_override": True,
+                }
+                ocr_banner_html = (
+                    f'<div style="padding:12px 14px;border-radius:10px;'
+                    f'background:#dbeafe;border:1px solid #60a5fa;color:#1e3a8a;'
+                    f'font-size:14px;margin-top:8px;">'
+                    f'<strong>OCR-confirmed:</strong> the photo shows '
+                    f'<code>{escape(ocr_result.label)}</code> '
+                    f'(EasyOCR confidence {ocr_result.confidence:.0%}). '
+                    f'Spatial-chain answer was overridden.'
+                    f'</div>'
+                )
+            elif ocr_result is not None and not ocr_result.available:
+                ocr_banner_html = (
+                    f'<div style="padding:10px 14px;border-radius:10px;'
+                    f'background:#fef3c7;border:1px solid #fde68a;color:#78350f;'
+                    f'font-size:13px;margin-top:8px;">'
+                    f'OCR unavailable: {escape(ocr_result.error or "easyocr import failed")}. '
+                    f'Using retrieval only.'
+                    f'</div>'
+                )
+            elif ocr_result is not None and ocr_result.label is None and ocr_result.detections:
+                # Detections happened but none crossed the threshold or
+                # mapped to a known label — surface for transparency.
+                summarised = ", ".join(
+                    sorted({d.raw_text for d in ocr_result.detections if d.raw_text})[:6]
+                )
+                if summarised:
+                    ocr_banner_html = (
+                        f'<div style="padding:10px 14px;border-radius:10px;'
+                        f'background:#f3f4f6;border:1px solid #e5e7eb;color:#374151;'
+                        f'font-size:12px;margin-top:8px;">'
+                        f"OCR saw text — <em>{escape(summarised)}</em> — "
+                        f"but no confident floor number. Using retrieval only."
+                        f'</div>'
+                    )
+
+            block_children = [
+                mo.md("### Hierarchical prediction"),
+                mo.md(
+                    "The spatial chain (floor → range → section) picks the "
+                    "**most specific** tier whose Top-K vote ratio is at "
+                    "least 60 %. The area chip at the bottom is "
+                    "orthogonal — it always tells you what *kind* of "
+                    "space the model thinks the photo shows. When OCR is "
+                    "enabled and confidently reads a floor number from the "
+                    "image, it overrides the spatial chain."
+                ),
+                mo.Html(
+                    render_tier_card(
+                        prediction,
+                        ground_truth=query_ground_truth,
+                        ground_truth_area=query_ground_truth_area,
+                    )
+                ),
+            ]
+            if ocr_banner_html:
+                block_children.append(mo.Html(ocr_banner_html))
+            prediction_block = mo.vstack(block_children)
         else:
             predicted, votes, total = summarize_prediction(results)
             prediction_block = mo.vstack(
