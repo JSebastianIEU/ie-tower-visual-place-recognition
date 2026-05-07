@@ -124,3 +124,92 @@ def get_feature_extractor(
     raise ValueError(
         f"Unsupported model '{model_name}'. Available options: {available}"
     )
+
+
+class ProjectionHead(nn.Module):
+    """Small 2-layer MLP that re-projects frozen features into a tighter
+    embedding space tuned for floor-level retrieval.
+
+    Architecture: ``in_dim → hidden → out_dim`` with BatchNorm + ReLU
+    between the layers. The output is L2-normalised so cosine search
+    against a FAISS Flat-IP index keeps working.
+
+    The default hidden = 256 and out_dim = 128 are sized for the
+    DINOv2 ViT-S 384-d input at our dataset scale (~2k gallery rows): big
+    enough to fit a meaningful manifold, small enough to train on CPU in
+    a few minutes.
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 384,
+        hidden_dim: int = 256,
+        out_dim: int = 128,
+        residual: bool = False,
+    ) -> None:
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        # When ``residual`` is True the head must keep the same dim as the
+        # input so we can add the input back. This biases initialization
+        # toward "identity + small perturbation" — useful when the frozen
+        # features are already strong and we just want to nudge them.
+        self.residual = residual
+        if residual:
+            assert out_dim == in_dim, (
+                f"residual heads require out_dim == in_dim, got "
+                f"out_dim={out_dim}, in_dim={in_dim}"
+            )
+        self.layers = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+        )
+        if residual:
+            # Initialise the last layer near zero so the head starts as
+            # an identity-ish mapping (output ≈ x).
+            nn.init.zeros_(self.layers[-1].weight)
+            nn.init.zeros_(self.layers[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        delta = self.layers(x)
+        if self.residual:
+            out = x + delta
+        else:
+            out = delta
+        return torch.nn.functional.normalize(out, dim=1)
+
+
+class DinoV2WithProjectionHead(nn.Module):
+    """Wraps a frozen DINOv2 backbone and a trainable ``ProjectionHead``.
+
+    The backbone is set to ``eval`` and its parameters are frozen at
+    construction time. ``forward`` projects the image through the
+    backbone, applies the head, and returns the L2-normalised output.
+
+    Usage::
+
+        backbone, _ = get_feature_extractor("dinov2_vits14_hires")
+        head = ProjectionHead(in_dim=384)
+        head.load_state_dict(torch.load(checkpoint))
+        model = DinoV2WithProjectionHead(backbone, head)
+        model.eval()
+
+    The head is intentionally separate from the backbone so the training
+    script can swap heads (different hidden dims, different margins)
+    without re-loading DINOv2 every time.
+    """
+
+    def __init__(self, backbone: nn.Module, head: ProjectionHead) -> None:
+        super().__init__()
+        self.backbone = backbone
+        for p in self.backbone.parameters():
+            p.requires_grad_(False)
+        self.head = head
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            features = self.backbone(images)
+        return self.head(features)
