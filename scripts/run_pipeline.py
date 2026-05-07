@@ -114,6 +114,17 @@ def parse_args() -> argparse.Namespace:
         default=str(INDEX_DIR / "gallery.index"),
         help="Where the FAISS index will be stored.",
     )
+    parser.add_argument(
+        "--use-fine-tuned-head",
+        default=None,
+        help=(
+            "Optional path to a ProjectionHead state_dict produced by "
+            "scripts/fine_tune_head.py. When set, every backbone embedding "
+            "is run through the head before being saved/indexed. The head "
+            "must match the backbone's output dim (384 for DINOv2 ViT-S, "
+            "768 for ViT-B)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -141,6 +152,50 @@ def main() -> None:
         num_workers=args.num_workers,
     )
 
+    fine_tuned_head_info = None
+    if args.use_fine_tuned_head:
+        from src.features.models import ProjectionHead  # local import to keep cold start cheap
+        import numpy as np_module  # noqa: F401
+
+        head_path = Path(args.use_fine_tuned_head)
+        if not head_path.exists():
+            raise FileNotFoundError(f"projection head checkpoint not found: {head_path}")
+        state = torch.load(str(head_path), map_location="cpu")
+        # Recover the dims from the loaded weights so we don't have to
+        # pass them on the CLI.
+        first_weight = state["layers.0.weight"]  # (hidden, in)
+        last_weight = state.get("layers.3.weight")  # (out, hidden)
+        in_dim_loaded = first_weight.shape[1]
+        hidden_dim_loaded = first_weight.shape[0]
+        out_dim_loaded = last_weight.shape[0] if last_weight is not None else hidden_dim_loaded
+        if in_dim_loaded != embedding_dim:
+            raise ValueError(
+                f"projection head expects in_dim={in_dim_loaded} but the "
+                f"backbone produces {embedding_dim}-d features."
+            )
+        head = ProjectionHead(
+            in_dim=in_dim_loaded,
+            hidden_dim=hidden_dim_loaded,
+            out_dim=out_dim_loaded,
+        )
+        head.load_state_dict(state)
+        head.to(device).eval()
+        with torch.no_grad():
+            projected = head(torch.from_numpy(embeddings).to(device).float()).cpu().numpy()
+        embeddings = projected.astype("float32")
+        embedding_dim = out_dim_loaded
+        fine_tuned_head_info = {
+            "path": str(head_path),
+            "in_dim": in_dim_loaded,
+            "hidden_dim": hidden_dim_loaded,
+            "out_dim": out_dim_loaded,
+        }
+        print(
+            f"[pipeline] applied projection head ({in_dim_loaded} -> "
+            f"{hidden_dim_loaded} -> {out_dim_loaded}); embeddings now "
+            f"{embeddings.shape}"
+        )
+
     embeddings_path, metadata_path = save_embeddings(
         embeddings=embeddings,
         metadata=metadata,
@@ -157,7 +212,10 @@ def main() -> None:
         "metric": args.metric,
         "num_rows": int(len(metadata)),
         "seed": SEED,
+        "has_projection_head": fine_tuned_head_info is not None,
     }
+    if fine_tuned_head_info is not None:
+        info["projection_head"] = fine_tuned_head_info
     info_path = Path(args.embedding_output_dir) / f"{args.output_prefix}_info.json"
     info_path.write_text(__import__("json").dumps(info, indent=2), encoding="utf-8")
 

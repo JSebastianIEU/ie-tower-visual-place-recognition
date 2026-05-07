@@ -320,16 +320,19 @@ Where we are on the full 25-label dataset (DINOv2 ViT-S at 518×518): **52.8 % T
 
 ### Hierarchical / progressive-specificity prediction
 
-The model often *almost* gets the floor right — it lands on the correct floor range but is split between two adjacent floors. Returning a confidently-wrong floor in that case is much worse for the user than admitting "you're somewhere on the mid-rise levels". The pipeline now produces a **four-tier prediction** per query and surfaces the most-specific tier whose Top-K vote ratio meets the confidence threshold (default 0.6).
+The model often *almost* gets the floor right — it lands on the correct floor range but is split between two adjacent floors. Returning a confidently-wrong floor in that case is much worse for the user than admitting "you're somewhere on the mid-rise levels". The pipeline now produces three complementary signals per query:
 
-The tiers, from most to least specific:
+1. **Spatial fallback chain** — `floor → floor_range → section`. The predictor walks from most specific to least specific and surfaces the first tier whose Top-K vote ratio meets the configured confidence threshold (default 0.6 = 3/5). The full chain is always returned so the UI can show what the model would have answered at every tier.
+2. **Area tag** — orthogonal label that answers "what kind of space is this?" (`hallway`, `elevator`, `stairs`, `classroom`, `chill_lounge`, …). Always rendered alongside the selected spatial tier; never a step down from `section`.
+3. **OCR override** (optional, see next subsection) — when EasyOCR confidently reads a floor-number plaque from the photo, the final answer snaps to that floor regardless of retrieval.
+
+The spatial tiers, from most to least specific:
 
 | Tier | Example label | When the model selects it |
 |---|---|---|
-| 1. Exact floor | `floor10`, `basement3` | The Top-K matches agree on a single floor (≥3 of 5 by default). |
-| 2. Floor range | `lowrise` (3–9), `midrise` (10–16), `highrise` (17–23), `basement` | The matches disagree on the exact floor but cluster within a single range. |
-| 3. Section | `above-ground`, `basement` | Even the range is unclear, but at least the model knows which half of the building. |
-| 4. Area type | `hallway`, `elevator`, `stairs`, `classroom`, `chill_lounge`, … | Vertical location is ambiguous; the model can only say what *kind of space* the photo shows. |
+| Exact floor | `floor10`, `basement3` | The Top-K matches agree on a single floor (≥3/5 by default). |
+| Floor range | `lowrise` (3–9), `midrise` (10–16), `highrise` (17–23), `basement` | The matches disagree on the exact floor but cluster within a single range. |
+| Section | `above-ground`, `basement` | Even the range is unclear, but at least the model knows which half of the building. |
 
 **Schema.** `scripts/annotate_hierarchy.py` populates three new columns on `data/metadata/dataset.csv` derived from the canonical filename and label:
 
@@ -339,29 +342,60 @@ The tiers, from most to least specific:
 
 The script is idempotent and runs as stage 3 of `scripts/run_all.py`. Re-running on a fully-annotated CSV is a no-op.
 
-**API.** `src.retrieval.hierarchical.hierarchical_predict(results, threshold=0.6)` returns a typed dict with the selected tier, the full fallback chain, and the threshold used. `explain_prediction(...)` formats it as a one-line human summary. The Marimo demo renders every tier as a row (selected highlighted in blue / green-when-correct / red-when-wrong); the Jupyter notebook prints the chain inline below the Top-K thumbnails.
+**API.** `src.retrieval.hierarchical.hierarchical_predict(results, threshold=0.6)` returns a typed dict with the selected spatial tier, the full fallback chain, and an orthogonal `area_tag`. `explain_prediction(...)` formats the dict as a one-line human summary. The Marimo demo renders every spatial tier as a row plus an `Area type` chip below the chain; the Jupyter notebook prints the same data inline.
 
-**Metrics.** `outputs/results/evaluation.json` gains a `hierarchical` block with per-tier Top-K accuracy, `tier_resolution_rate` (fraction of queries that resolved at each tier), and `tier_when_resolved_accuracy` (accuracy of the model's answer at each tier when it chose to answer there). Held-out queries on the current production setup (DINOv2 ViT-S/14 hires, threshold 0.6):
+**Metrics.** `outputs/results/evaluation.json` gains a `hierarchical` block with per-tier Top-K accuracy, `tier_resolution_rate` (fraction of queries that resolved at each spatial tier — the three values sum to 1.0), `tier_when_resolved_accuracy` (correctness of the spatial answer when chosen), `area_tag_accuracy` and `area_tag_coverage`. Held-out queries on the current production setup (DINOv2 ViT-S/14 hires, threshold 0.6):
 
-| Tier | Resolution rate | Accuracy when resolved |
+| Signal | Coverage / resolution rate | Accuracy when resolved |
 |---|---|---|
-| Exact floor | 38.5 % | 80.4 % |
-| Floor range | 44.8 % | 60.2 % |
-| Section | 16.7 % | 84.5 % |
-| Area type | 0.0 % | — |
+| Spatial — exact floor | 38.5 % | 80.4 % |
+| Spatial — floor range | 44.8 % | 60.2 % |
+| Spatial — section | 16.7 % | 84.5 % |
+| Area tag (orthogonal) | 100 % | 83.3 % |
 
-Read together: about 4 in 10 held-out queries get a confident floor-level answer (correct ~80 % of the time); the rest fall back to a coarser tier where the model is also accurate. Lowering the threshold (`hierarchical_threshold` argument to `evaluate_retrieval`) shifts more weight toward the floor tier at the cost of accuracy.
+Read together: about 4 in 10 held-out queries get a confident floor-level answer (right ~80 % of the time); the rest fall back to a coarser spatial tier where the model is still ~60–85 % accurate. The area tag is always populated and tells the user what kind of space the photo is regardless of vertical certainty.
+
+### OCR head — short-circuit when a floor number is visible
+
+The biggest single failure mode of the spatial chain is vertical confusion (`floor10_hallway_left` vs `floor15_hallway_left`). The cheapest fix is to read floor-number plaques directly: if the image shows the floor written on the wall, retrieval is the wrong tool — OCR is. `src/features/ocr_predictor.py` wraps EasyOCR with a tight floor-number regex (`B<N>` for basement, `<N>` for above-ground) and a guard that drops detections whose label is not in the gallery's known set.
+
+The Marimo demo exposes a checkbox ("Use OCR") that is on by default. Toggle it off if you want pure-retrieval behaviour.
+
+The Jupyter notebook adds a `predict_with_ocr(path)` helper that returns `(final_label, ocr_result, retrieval_results)` so you can compare OCR vs retrieval side by side.
+
+The evaluation script picks up an optional `--use-ocr` flag:
+
+```bash
+python scripts/run_evaluation.py --use-ocr
+```
+
+When passed, every held-out query is also passed through OCR, and the JSON gains an `ocr` block with `ocr_coverage` (fraction of queries that produced a confident floor label), `ocr_top_1_accuracy` (correctness when one was produced) and `ocr_overall_top_1` (correct OCR labels divided by total queries). EasyOCR weights download on first use (~150 MB) into `~/.EasyOCR/`; cached after that.
+
+Held-out result on the current production setup (504 queries, threshold 0.6 EasyOCR confidence + label must be in the gallery):
+
+| Metric | Value | What it means |
+|---|---|---|
+| `ocr_coverage` | 7.3 % | Only ~7 % of held-out frames have a confident floor-number reading. Most gallery frames are hallway / elevator interiors without large numerical signage. |
+| `ocr_top_1_accuracy` | 56.8 % | When OCR did produce a label, it was the correct floor 57 % of the time. The 43 % miss rate comes from "10"-shaped strings appearing in unrelated places (room numbers, exit signs) — the regex catches them but they happen to map to a real gallery floor. |
+| `ocr_overall_top_1` | 4.2 % | Correct OCR labels as a fraction of all queries. Modest in absolute terms — OCR is a *supplement*, not a replacement for retrieval. |
+
+**Honest reading.** Coverage is the binding constraint here, not accuracy. To get more value out of OCR we would need either (a) videos that explicitly capture the floor-number plaques (a data-collection ask) or (b) tighter regex / spatial constraints (e.g. require the digit to live inside a black bordered square, the IE Tower's plaque shape) so the false-positive rate drops. The infrastructure to surface OCR predictions is in place and zero-cost when toggled off.
+
+**Caveats**
+
+* OCR is significantly slower than retrieval (~0.5–1 s per image on CPU). It is opt-out in the demo (which runs once per query) and opt-in in batch evaluation.
+* Phone uploads at low resolution sometimes can't read tiny floor plaques. If OCR returns no confident detections the retrieval result is used as before — no regression.
+* The OCR predictor never invents a floor: detections that don't map to a label present in the gallery are silently dropped. So if you query for a floor we don't index, OCR can't fake an answer.
 
 ### Next-iteration roadmap
 
-The remaining ideas, in expected-impact order. PR-A (the hierarchical predictor above) has shipped; PR-B / PR-C / PR-D are next:
+PR-A (hierarchical predictor) and PR-B (OCR override) have shipped. The remaining ideas in expected-impact order:
 
-1. **Triplet-loss fine-tuning of a projection head.** Freeze DINOv2 ViT-S, train a small 2-layer MLP on top with positive pairs = same floor and negative pairs = different floor. Re-uses the existing gallery as supervision and is cheap to run. Typical gain on similar VPR datasets: **+5–15 pp** Top-1.
-2. **Capture a second pass per floor.** Each location filmed a second time on a different day, different phone, different lighting. This is the only way to make the held-out queries honest and to break the consecutive-frame leakage. Adds work for the team, not for the model.
-3. **OCR head for floor-number signage.** Run a tiny EasyOCR / Tesseract head on each query and route the prediction whenever a floor number is visible in the frame. Targets exactly the vertical-confusion failure mode.
-4. **Test-time augmentation.** Multi-crop / multi-scale at inference, then average. Cheap to add, often **+1–2 pp**.
-5. **Re-ranking with query expansion.** Initial Top-30 from FAISS, then re-search using the average of the top-K matches as a refined query. Standard image-retrieval trick.
-6. **Bigger backbone / NetVLAD pooling.** Diminishing returns relative to (1)–(3) but useful once those are exhausted.
+1. **Triplet-loss fine-tuning of a projection head** (PR-C). Freeze DINOv2 ViT-S, train a small 2-layer MLP on top with positive pairs = same floor and negative pairs = different floor. Re-uses the existing gallery as supervision and is cheap to run. Typical gain on similar VPR datasets: **+5–15 pp** Top-1.
+2. **Capture a second pass per floor** (PR-D). Each location filmed a second time on a different day, different phone, different lighting. Only way to make the held-out queries honest and to break consecutive-frame leakage. Adds work for the team, not for the model.
+3. **Test-time augmentation.** Multi-crop / multi-scale at inference, then average. Cheap to add, often **+1–2 pp**.
+4. **Re-ranking with query expansion.** Initial Top-30 from FAISS, then re-search using the average of the top-K matches as a refined query. Standard image-retrieval trick.
+5. **Bigger backbone / NetVLAD pooling.** Diminishing returns relative to (1)–(2) but useful once those are exhausted.
 
 ---
 

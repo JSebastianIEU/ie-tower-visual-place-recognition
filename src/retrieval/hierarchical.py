@@ -1,26 +1,23 @@
 """Hierarchical / progressive-specificity predictor.
 
 The retrieval pipeline returns the Top-K gallery matches. From those we
-compute a vote at four levels of specificity:
+compute two complementary signals:
 
-    1. ``floor``        — the most specific label the dataset exposes
-                          (``floor10``, ``basement3``, …).
-    2. ``floor_range``  — coarser bucket (``lowrise`` / ``midrise`` /
-                          ``highrise`` / ``basement``).
-    3. ``section``      — coarsest spatial bucket (``above-ground`` /
-                          ``basement``).
-    4. ``area``         — orthogonal: the type of space (``hallway``,
-                          ``elevator``, ``stairs``, ``classroom``,
-                          ``chill_lounge``, …). Useful as the last-ditch
-                          fallback when the model can't pin down vertical
-                          location at all.
+1. A **spatial fallback chain** (floor → floor_range → section) that
+   answers "where are you in the building, vertically?". The predictor
+   walks the chain from most specific to least specific and picks the
+   first level whose Top-K vote ratio meets the configured confidence
+   threshold. The full chain is always returned so the UI can show what
+   the model would have answered at every tier.
 
-For every level we count how many of the Top-K gallery matches agree on a
-single value and divide by ``K`` to get a confidence ratio. The selected
-"best" tier is the most-specific one whose ratio meets a threshold
-(default 0.6, i.e. 3 out of 5). The predictor always returns the full
-fallback chain so the UI can show what the model would have said at each
-tier.
+2. An **orthogonal area tag** (hallway, elevator, stairs, classroom,
+   chill_lounge, …) that answers "what kind of space is this?". This is
+   not a step in the spatial fallback chain — it is shown alongside the
+   selected tier as a secondary label. This is what changed between the
+   first version of the predictor and the OCR PR: previously ``area``
+   sat at the bottom of the chain and was never selected because
+   ``section`` (only two values) virtually always met the threshold
+   first. Splitting it out makes both signals legible at the same time.
 """
 
 from __future__ import annotations
@@ -39,11 +36,10 @@ from src.retrieval.search import SearchResult
 DEFAULT_CONFIDENCE_THRESHOLD = 0.6
 
 
-# Specificity order, most specific first. The selected best is the first
-# tier whose ratio meets the threshold; if none do, we still return the
-# best available tier (the last entry, i.e. ``area``) so the user always
-# sees *something*.
-_TIER_ORDER: tuple[str, ...] = ("floor", "floor_range", "section", "area")
+# Spatial fallback chain — most specific first. The selected best is the
+# first tier whose ratio meets the threshold; if none do, we still return
+# the least-specific tier so the user always sees *something*.
+_SPATIAL_TIER_ORDER: tuple[str, ...] = ("floor", "floor_range", "section")
 
 
 # Human-readable label per tier — only used for explanations / UI banners.
@@ -94,48 +90,47 @@ def hierarchical_predict(
     results: list[SearchResult],
     threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> dict:
-    """Compute the four-tier prediction from a Top-K result list.
+    """Compute the spatial fallback chain plus the orthogonal area tag.
 
     Returns a dict shaped like::
 
         {
-          "best": {"level": "floor", "label": "floor12", "votes": 4, "k": 5,
-                   "ratio": 0.8, "human_level": "exact floor"},
+          "best": {"level": "floor", "label": "floor12", ...},
           "selected_level": "floor",
           "fallback_chain": [
-            {"level": "floor",       "label": "floor12",      "votes": 4, ...},
-            {"level": "floor_range", "label": "midrise",      "votes": 5, ...},
-            {"level": "section",     "label": "above-ground", "votes": 5, ...},
-            {"level": "area",        "label": "hallway",      "votes": 4, ...},
+            {"level": "floor",       "label": "floor12",      ...},
+            {"level": "floor_range", "label": "midrise",      ...},
+            {"level": "section",     "label": "above-ground", ...},
           ],
+          "area_tag": {"level": "area", "label": "hallway", "votes": 4, ...},
           "threshold": 0.6,
         }
 
-    ``best`` is always populated. If no tier reaches the threshold, the
-    least-specific tier (``area``) is selected so the consumer always has
-    at least a coarse answer to show.
+    ``best`` is always populated. If no spatial tier reaches the threshold,
+    the least-specific spatial tier (``section``) is selected so the
+    consumer always has at least a coarse spatial answer to show.
+    ``area_tag`` is independent — it is the area-vote summary and gets
+    rendered alongside whichever spatial tier was selected.
     """
     k = len(results)
 
-    # Floor / floor_range / section come from the gallery row's columns.
-    # ``label`` doubles as the floor level (the metadata's primary label).
-    floor_vote_label, floor_votes, _ = _vote([r.label for r in results])
-    range_vote_label, range_votes, _ = _vote([r.floor_range for r in results])
-    section_vote_label, section_votes, _ = _vote([r.section for r in results])
-    area_vote_label, area_votes, _ = _vote([r.area for r in results])
+    floor_label, floor_votes, _ = _vote([r.label for r in results])
+    range_label, range_votes, _ = _vote([r.floor_range for r in results])
+    section_label, section_votes, _ = _vote([r.section for r in results])
+    area_label, area_votes, _ = _vote([r.area for r in results])
 
-    tiers = {
-        "floor":       TierVote("floor",       floor_vote_label,   floor_votes,   k),
-        "floor_range": TierVote("floor_range", range_vote_label,   range_votes,   k),
-        "section":     TierVote("section",     section_vote_label, section_votes, k),
-        "area":        TierVote("area",        area_vote_label,    area_votes,    k),
+    spatial_tiers = {
+        "floor":       TierVote("floor",       floor_label,   floor_votes,   k),
+        "floor_range": TierVote("floor_range", range_label,   range_votes,   k),
+        "section":     TierVote("section",     section_label, section_votes, k),
     }
+    area_tier = TierVote("area", area_label, area_votes, k)
 
-    fallback_chain = [tiers[level].as_dict() for level in _TIER_ORDER]
+    fallback_chain = [spatial_tiers[level].as_dict() for level in _SPATIAL_TIER_ORDER]
 
     selected_level = None
-    for level in _TIER_ORDER:
-        tier = tiers[level]
+    for level in _SPATIAL_TIER_ORDER:
+        tier = spatial_tiers[level]
         if tier.label is None:
             continue
         if tier.ratio >= threshold:
@@ -143,30 +138,35 @@ def hierarchical_predict(
             break
 
     if selected_level is None:
-        # No tier hit the threshold — fall back to the least specific one
-        # that has a label at all.
-        for level in reversed(_TIER_ORDER):
-            if tiers[level].label is not None:
+        # Nothing reached the threshold — fall back to the least specific
+        # spatial tier that has a label at all.
+        for level in reversed(_SPATIAL_TIER_ORDER):
+            if spatial_tiers[level].label is not None:
                 selected_level = level
                 break
 
-    best = tiers[selected_level].as_dict() if selected_level else None
+    best = spatial_tiers[selected_level].as_dict() if selected_level else None
     return {
         "best": best,
         "selected_level": selected_level,
         "fallback_chain": fallback_chain,
+        "area_tag": area_tier.as_dict(),
         "threshold": threshold,
     }
 
 
 def explain_prediction(prediction: dict) -> str:
-    """Render a one-line human-readable explanation of the chosen tier.
-
-    Useful in the demo banner and in the Jupyter notebook output.
+    """Render a one-line human-readable explanation of the chosen tier
+    plus the orthogonal area tag.
     """
     best = prediction.get("best")
+    area_tag = prediction.get("area_tag") or {}
+    area_label = area_tag.get("label")
+    area_ratio = area_tag.get("ratio", 0.0)
+
     if not best or best.get("label") is None:
-        return "No confident prediction at any tier."
+        return "No confident prediction at any spatial tier."
+
     level = best["level"]
     label = best["label"]
     votes = best["votes"]
@@ -174,20 +174,18 @@ def explain_prediction(prediction: dict) -> str:
     ratio = best["ratio"]
 
     if level == "floor":
-        return f"Floor: {label} ({votes}/{k} = {ratio:.0%}, exact)."
-    if level == "floor_range":
-        return (
+        head = f"Floor: {label} ({votes}/{k} = {ratio:.0%}, exact)"
+    elif level == "floor_range":
+        head = (
             f"Range: {label} ({votes}/{k} = {ratio:.0%}). "
             "Top-K split between same-range floors — exact floor uncertain."
         )
-    if level == "section":
-        return (
+    else:  # section
+        head = (
             f"Section: {label} ({votes}/{k} = {ratio:.0%}). "
             "Model confident only about above-ground vs basement."
         )
-    if level == "area":
-        return (
-            f"Area type: {label} ({votes}/{k} = {ratio:.0%}). "
-            "Vertical location is unclear — most matches share this kind of space."
-        )
-    return f"{level}: {label} ({votes}/{k} = {ratio:.0%})."
+
+    if area_label:
+        return f"{head}  ·  Looks like a {area_label} ({area_ratio:.0%} of matches)."
+    return head + "."
