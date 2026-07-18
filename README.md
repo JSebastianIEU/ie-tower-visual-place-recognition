@@ -17,7 +17,7 @@ The pipeline is intentionally small and decoupled: each step is a standalone scr
 | Index          | FAISS Flat-IP over L2-normalised embeddings |
 | Held-out queries | ~430, stride-based per video |
 
-These are the numbers we agreed to merge to `main`. The next iteration will tackle the documented failure modes (vertical confusion across above-ground floors, single-pass-per-floor data) — see "Analysis: why isn't accuracy higher?" near the bottom of this file.
+These are the numbers on `main`. The next iteration will tackle the documented failure modes (vertical confusion across above-ground floors, single-pass-per-floor data) — see "Analysis: why isn't accuracy higher?" near the bottom of this file.
 
 The interactive layer is split between a Marimo dashboard (`app/demo.py`) and a Jupyter notebook (`notebooks/test_model.ipynb`). The core pipeline lives in regular Python modules under `src/` and `scripts/`, so contributions to feature extraction, retrieval or evaluation can land independently.
 
@@ -93,10 +93,11 @@ ie-tower-visual-place-recognition/
 │   └── demo.py                # Marimo notebook for interactive testing
 ├── data/
 │   ├── metadata/dataset.csv   # The single source of truth for the dataset
-│   ├── processed_frames/      # Extracted JPGs (gitignored)
+│   ├── processed_frames/      # Extracted JPGs (~2.9k files, ~120 MB, committed)
 │   └── raw_videos/            # Source videos pulled from Drive (gitignored)
 ├── outputs/
 │   ├── embeddings/            # .npy + metadata CSV
+│   ├── ft_models/             # Trained projection heads (.pth) + training_log.json
 │   ├── index/                 # FAISS index files
 │   └── results/               # evaluation.json
 ├── scripts/
@@ -104,6 +105,7 @@ ie-tower-visual-place-recognition/
 │   ├── build_index.py                   # FAISS index from existing embeddings
 │   ├── extract_embeddings.py            # Standalone embedding extraction
 │   ├── extract_frames_and_update_csv.py # Video -> frames -> CSV (append mode)
+│   ├── fine_tune_head.py                # Triplet-loss projection head training
 │   ├── run_evaluation.py                # Top-K accuracy + mAP -> JSON
 │   ├── run_pipeline.py                  # Full pipeline: embeddings + index
 │   ├── run_query.py                     # CLI single-image query
@@ -129,14 +131,14 @@ All raw videos live in the shared Google Drive folder: <https://drive.google.com
 
 The folder must remain shared as **"anyone with the link can view"** so `gdown` can enumerate it without OAuth.
 
-### Coverage by team member
+### Dataset coverage
 
-| Member | Labels | CSV rows | Frames in repo | Raw videos in Drive |
+| Label group | Labels | CSV rows | Frames in repo | Raw videos in Drive |
 |-------|--------|---------|----------------|---------------------|
-| Ariel | `floor10..16` | ✅ 925 | ✅ committed (`data/processed_frames/floor10..16/`) | ✅ 33 videos |
-| Sebas | `floor3..9` | ✅ 759 | ✅ committed (`data/processed_frames/floor3..9/`) | ✅ 28 videos |
-| Farah | `floor17..23` | ✅ 721 | ✅ committed (`data/processed_frames/floor17..23/`) | ✅ 30 videos |
-| Ayo | `basement0`, `basement2`, `basement3`, `basement4` | ✅ 472 | ✅ committed (`data/processed_frames/basement{0,2,3,4}/`) | ✅ 32 videos |
+| Mid-rise | `floor10..16` | 925 | committed (`data/processed_frames/floor10..16/`) | 33 videos |
+| Low-rise | `floor3..9` | 759 | committed (`data/processed_frames/floor3..9/`) | 28 videos |
+| High-rise | `floor17..23` | 721 | committed (`data/processed_frames/floor17..23/`) | 30 videos |
+| Basements | `basement0`, `basement2`, `basement3`, `basement4` | 472 | committed (`data/processed_frames/basement{0,2,3,4}/`) | 32 videos |
 | **Total** | **25 labels** | **2877** | **all on disk** | **123 videos** |
 
 **First run after a fresh clone — any machine, 3 commands:**
@@ -171,22 +173,22 @@ bN_<area>_<descriptor>.<ext>      # basement floors    (b0 ... b4)
 
 - **Above-ground prefix `fNN`** — two-digit floor with leading zero (`f03`, `f04`, …, `f23`). The script normalises the dataset label to `floor3, floor4, …, floor23` (no leading zero).
 - **Basement prefix `bN`** — one-digit floor (`b0`, `b2`, `b3`, `b4`). The script normalises the label to `basement0, basement2, basement3, basement4`. **`b3` is a separate physical floor from `f3`** — the basement label keeps them apart.
-- `<area>` — canonical vocabulary: `central`, `classroom`, `elevator`, `hallway`, `stairs`, `open_area`, `studyroom`, `meetingroom`, plus the basement-only vocabulary Ayo introduced (`basement_lift`, `chill_lounge`, `food_corner`, `auditorium_main`, `pianolounge_ceiling`, `iestore_outside`, etc.). Any descriptive token is fine — the model only uses the floor label, not the area. Aliases: `class` → `classroom`, `classrom` → `classroom` (Ariel typo), `center` → `central`, `cafeteria` → `central`.
+- `<area>` — canonical vocabulary: `central`, `classroom`, `elevator`, `hallway`, `stairs`, `open_area`, `studyroom`, `meetingroom`, plus the basement-only vocabulary (`basement_lift`, `chill_lounge`, `food_corner`, `auditorium_main`, `pianolounge_ceiling`, `iestore_outside`, etc.). Any descriptive token is fine — the model only uses the floor label, not the area. Aliases: `class` → `classroom`, `classrom` → `classroom` (legacy typo), `center` → `central`, `cafeteria` → `central`.
 - `<descriptor>` — `main`, `left`, `right`, `right2`, `back`, `front`, `c025` (clip ID for multi-take captures), …
 - `<ext>` — `mp4`, `mov`, `avi`, `m4v`. Uppercase extensions are normalised to lowercase automatically.
 
-**Camera-suffix uploads** (Ayo's pattern): names like `b3_chill_lounge__A001_04081241_C029.mov` are accepted as-is. The sync script auto-strips the `__A001_<timestamp>_` portion and keeps the clip ID as the descriptor → `b3_chill_lounge_c029.mov`. No manual renaming required.
+**Camera-suffix uploads**: names like `b3_chill_lounge__A001_04081241_C029.mov` are accepted as-is. The sync script auto-strips the `__A001_<timestamp>_` portion and keeps the clip ID as the descriptor → `b3_chill_lounge_c029.mov`. No manual renaming required.
 
 ✅ Good: `f03_hallway_left.mp4`, `f17_classroom_main.mov`, `b3_chill_lounge_c029.mov`, `b0_basement_lift_c030.mov`
 ❌ Bad: `IMG_0123.mov`, `floor3-hallway.mp4`, `f3_hallway.mp4` (missing leading zero on above-ground)
 
 ### Documented equivalences
 
-These exist for backward compatibility with Ariel's existing 879 rows and Farah/Sebas's vocabulary:
+These exist for backward compatibility with the 879 rows captured in the first pass and the vocabulary used alongside them:
 
-- **`stairs == bathroom`** — what Ariel labelled `*_stairs_*` is actually pictures of bathrooms in some floors. We keep the `stairs` token to avoid rewriting the existing CSV. New videos that show bathrooms should also use `stairs`.
-- **`classroom == classrom`** — Ariel's CSV contains the typo `classrom`. Both spellings are accepted; new videos should prefer `classroom`.
-- **`cafeteria == central`** — Farah originally tagged the f22 cafeteria as a separate area, but it is the same open central space. Collapsed into `central` so the label space stays small.
+- **`stairs == bathroom`** — some frames labelled `*_stairs_*` are actually pictures of bathrooms. We keep the `stairs` token to avoid rewriting the existing CSV. New videos that show bathrooms should also use `stairs`.
+- **`classroom == classrom`** — the original CSV contains the typo `classrom`. Both spellings are accepted; new videos should prefer `classroom`.
+- **`cafeteria == central`** — the f22 cafeteria was originally tagged as a separate area, but it is the same open central space. Collapsed into `central` so the label space stays small.
 
 ### Workflow when you upload new videos
 
@@ -194,7 +196,7 @@ These exist for backward compatibility with Ariel's existing 879 rows and Farah/
 2. Pull them locally with `python scripts/sync_drive_data.py`. The script will warn (and exit non-zero) if anything is mis-named.
 3. Run `python scripts/extract_frames_and_update_csv.py`. By default it runs in append mode, so it preserves the rows other team members already contributed.
 4. Re-run `python scripts/assign_splits.py` so the new rows get a `gallery`/`query` assignment.
-5. Commit the updated `data/metadata/dataset.csv` and push. The frames and videos themselves stay gitignored — share them through Drive only.
+5. Commit the updated `data/metadata/dataset.csv` **and the new frames under `data/processed_frames/`** — both are versioned so a fresh clone can run the pipeline without Drive access. Only the raw videos stay gitignored; share those through Drive.
 
 ---
 
@@ -276,7 +278,7 @@ python scripts/run_query.py --image path/to/photo.jpg
 
 Both options need the pipeline to have produced `outputs/index/gallery.index` and `outputs/embeddings/gallery_metadata.csv` first (run `python scripts/run_pipeline.py` once).
 
-**Option A — Marimo web app (recommended for the demo):**
+**Option A — Marimo web app (best for interactive exploration):**
 
 ```bash
 marimo edit app/demo.py
@@ -284,7 +286,7 @@ marimo edit app/demo.py
 
 Drag-and-drop a JPG/PNG into the upload widget, see a green banner with the predicted floor (majority vote across the Top-K) plus per-result thumbnails, scores, and labels. EXIF rotation is applied automatically so phone photos are upright.
 
-**Option B — Jupyter notebook (recommended for the professor / quick test):**
+**Option B — Jupyter notebook (quick test / scripted checks):**
 
 ```bash
 jupyter notebook notebooks/test_model.ipynb
@@ -312,8 +314,8 @@ Where we are on the full 25-label dataset (DINOv2 ViT-S at 518×518): **52.8 % T
 ### Things to watch for when reading the numbers
 
 - **Consecutive-frame leakage.** At 1 FPS, frames N and N+1 of the same walkthrough look near-identical, so Top-1 will always look optimistic. Increase `--every` in `assign_splits.py` to harden the split.
-- **Class imbalance.** Some floors have more captured areas than others (Ariel's `floor10` has 7 areas, others 4–5). Global mAP is biased toward over-represented labels. Always read the per-floor breakdown alongside.
-- **`stairs == bathroom` legacy alias.** A single label covers two visually distinct scenes on Ariel's floors. Expect a slightly lower per-class accuracy for `stairs` queries.
+- **Class imbalance.** Some floors have more captured areas than others (`floor10` has 7 areas, others 4–5). Global mAP is biased toward over-represented labels. Always read the per-floor breakdown alongside.
+- **`stairs == bathroom` legacy alias.** A single label covers two visually distinct scenes on some floors. Expect a slightly lower per-class accuracy for `stairs` queries.
 - **Empty `device` / `lighting` columns.** The split is stride-based, not condition-based. Do not interpret these metrics as evidence of robustness to a new phone or to a new lighting condition.
 - **EXIF rotation** is already handled in `app/demo.py` and `notebooks/test_model.ipynb` via `ImageOps.exif_transpose`. If you build a new entry point, remember to do the same — otherwise iPhone uploads come in sideways and the prediction collapses.
 - **Disk usage.** ~2.9 k JPEGs (~120 MB) committed under `data/processed_frames/`. Embeddings + FAISS index together stay below 50 MB and are gitignored.
@@ -387,15 +389,45 @@ Held-out result on the current production setup (504 queries, threshold 0.6 Easy
 * Phone uploads at low resolution sometimes can't read tiny floor plaques. If OCR returns no confident detections the retrieval result is used as before — no regression.
 * The OCR predictor never invents a floor: detections that don't map to a label present in the gallery are silently dropped. So if you query for a floor we don't index, OCR can't fake an answer.
 
+### Fine-tuned projection head
+
+Frozen generic features are the third structural limit listed above, and the cheapest way to attack it is to learn a small place-specific projection on top of them rather than fine-tuning the backbone. `scripts/fine_tune_head.py` trains a 2-layer MLP on the **cached** DINOv2 embeddings using batch-hard triplet loss — positives are frames from the same floor, negatives are frames from a different floor.
+
+Training on cached features instead of raw images is what makes this practical: DINOv2 ViT-S/14 at 518x518 costs ~5 s per image on CPU, so 2373 gallery rows x 50 epochs would run for 80+ hours. Against pre-computed embeddings the whole loop finishes in a couple of minutes.
+
+```bash
+# Requires outputs/embeddings/ to exist (run scripts/run_pipeline.py first).
+python scripts/fine_tune_head.py                       # defaults: hidden 256, out 128, margin 0.2
+python scripts/fine_tune_head.py --residual --margin 0.10
+python scripts/fine_tune_head.py --hidden-dim 256 --out-dim 384 --epochs 60
+```
+
+Only `split == "gallery"` rows are used for training; the `split == "query"` rows stay held out and drive checkpoint selection (the best held-out Top-1 wins).
+
+**Trained checkpoints** live in `outputs/ft_models/` and are committed — they are small (0.5–0.8 MB each):
+
+| Checkpoint | Head | Margin |
+|---|---|---|
+| `head_nonres_d128_m0.20.pth` | non-residual, out-dim 128 | 0.20 |
+| `head_nonres_d256_m0.20.pth` | non-residual, out-dim 256 | 0.20 |
+| `head_nonres_d384_m0.20.pth` | non-residual, out-dim 384 | 0.20 |
+| `head_residual_m0.05.pth` | residual | 0.05 |
+| `head_residual_m0.10.pth` | residual | 0.10 |
+| `head_residual_m0.20.pth` | residual | 0.20 |
+| `projection_head.pth` | best run, default output name | — |
+
+`outputs/ft_models/training_log.json` holds the per-epoch loss/accuracy trace and the full config dict for the most recent run. That run (non-residual, out-dim 384, margin 0.20, 60 epochs, seed 42) moved held-out accuracy from **48.6 % to 56.0 % Top-1** and **69.8 % to 73.2 % Top-5** — roughly **+7 pp** Top-1 over the same embeddings unprojected.
+
+Read that gain with the same caveat as every other number here: the held-out queries still come from the same single walkthrough as the gallery frames, so the head is partly learning walkthrough-specific structure. A second capture pass (item 1 in the roadmap below) is what would make this number trustworthy.
+
 ### Next-iteration roadmap
 
-PR-A (hierarchical predictor) and PR-B (OCR override) have shipped. The remaining ideas in expected-impact order:
+PR-A (hierarchical predictor), PR-B (OCR override) and PR-C (triplet fine-tuning) have shipped — see "Fine-tuned projection head" above for PR-C. The remaining ideas in expected-impact order:
 
-1. **Triplet-loss fine-tuning of a projection head** (PR-C). Freeze DINOv2 ViT-S, train a small 2-layer MLP on top with positive pairs = same floor and negative pairs = different floor. Re-uses the existing gallery as supervision and is cheap to run. Typical gain on similar VPR datasets: **+5–15 pp** Top-1.
-2. **Capture a second pass per floor** (PR-D). Each location filmed a second time on a different day, different phone, different lighting. Only way to make the held-out queries honest and to break consecutive-frame leakage. Adds work for the team, not for the model.
-3. **Test-time augmentation.** Multi-crop / multi-scale at inference, then average. Cheap to add, often **+1–2 pp**.
-4. **Re-ranking with query expansion.** Initial Top-30 from FAISS, then re-search using the average of the top-K matches as a refined query. Standard image-retrieval trick.
-5. **Bigger backbone / NetVLAD pooling.** Diminishing returns relative to (1)–(2) but useful once those are exhausted.
+1. **Capture a second pass per floor** (PR-D). Each location filmed a second time on a different day, different phone, different lighting. Only way to make the held-out queries honest and to break consecutive-frame leakage. Adds work for the team, not for the model.
+2. **Test-time augmentation.** Multi-crop / multi-scale at inference, then average. Cheap to add, often **+1–2 pp**.
+3. **Re-ranking with query expansion.** Initial Top-30 from FAISS, then re-search using the average of the top-K matches as a refined query. Standard image-retrieval trick.
+4. **Bigger backbone / NetVLAD pooling.** Diminishing returns relative to (1)–(2) but useful once those are exhausted.
 
 ---
 
@@ -425,6 +457,16 @@ PR-A (hierarchical predictor) and PR-B (OCR override) have shipped. The remainin
 - The Marimo demo applies EXIF transpose so query images render the same regardless of upload device.
 
 Recommended Python: **3.11+** (tested on 3.11 and 3.14).
+
+---
+
+## Team
+
+Built as a group project by Ariel, Ayo, Farah and Sebas. The 123 source videos
+and the 2,877 frames derived from them were captured collectively: the
+above-ground floors were split three ways (low-rise, mid-rise, high-rise) and
+the four basement levels were covered separately. See "Dataset coverage" above
+for how the labels break down.
 
 ---
 
