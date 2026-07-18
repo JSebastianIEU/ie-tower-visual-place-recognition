@@ -207,9 +207,9 @@ __marimo__/
 # Raw videos are large (~3 GB) and live only in the team Drive — never commit.
 data/raw_videos/*
 !data/raw_videos/.gitkeep
-# Processed frames ARE committed: the team agreed to version them so anyone
-# who clones the repo can run the pipeline without re-downloading from Drive.
-# Total ~1-2 GB of small JPEGs. (Re-add the two lines below to opt out.)
+# Processed frames ARE committed so anyone who clones the repo can run the
+# pipeline without re-downloading from Drive.
+# Total ~2.9k JPEGs, ~120 MB. (Re-add the two lines below to opt out.)
 # data/processed_frames/*
 # !data/processed_frames/.gitkeep
 # Outputs (embeddings, FAISS index, eval JSON) are reproducible from frames +
@@ -226,3 +226,7 @@ outputs/results/*
 # embeddings/index/eval blobs under each backbone subdir are gitignored.
 outputs/_compare/*
 !outputs/_compare/comparison.json
+
+# macOS
+.DS_Store
+**/.DS_Store
