@@ -207,11 +207,10 @@ __marimo__/
 # Raw videos are large (~3 GB) and live only in the team Drive — never commit.
 data/raw_videos/*
 !data/raw_videos/.gitkeep
-# Processed frames ARE committed so anyone who clones the repo can run the
-# pipeline without re-downloading from Drive.
-# Total ~2.9k JPEGs, ~120 MB. (Re-add the two lines below to opt out.)
-# data/processed_frames/*
-# !data/processed_frames/.gitkeep
+# Processed frames are NOT committed. They ship as a release asset instead —
+# pull them with `python scripts/fetch_data.py`. See README > Data & privacy.
+data/processed_frames/
+
 # Outputs (embeddings, FAISS index, eval JSON) are reproducible from frames +
 # scripts, so we keep them out of git to avoid bloat.
 outputs/embeddings/*

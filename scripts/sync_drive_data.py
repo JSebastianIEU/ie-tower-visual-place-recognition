@@ -20,6 +20,14 @@ Behaviour:
 
 The Drive folder must be shared as "anyone with the link can view" for
 ``gdown`` to be able to enumerate it without OAuth.
+
+The folder ID is not stored in this repository. Pass it explicitly::
+
+    python scripts/sync_drive_data.py --drive-folder-id <id>
+    IE_TOWER_DRIVE_FOLDER_ID=<id> python scripts/sync_drive_data.py
+
+This script only handles the **raw videos**. The processed frames come from the
+GitHub release instead — see ``scripts/fetch_data.py``.
 """
 
 from __future__ import annotations
@@ -37,9 +45,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.utils.config import RAW_VIDEOS_DIR
 
 
-DRIVE_FOLDER_URL = (
-    "https://drive.google.com/drive/folders/1b37B-V67FRRttLNrbHQ0bk4uywsZpiDH"
-)
+DRIVE_FOLDER_ENV_VAR = "IE_TOWER_DRIVE_FOLDER_ID"
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mov", ".mp4", ".avi", ".m4v"}
 
@@ -295,9 +301,15 @@ def parse_args() -> argparse.Namespace:
         help="Directory where raw videos will be saved.",
     )
     parser.add_argument(
+        "--drive-folder-id",
+        default=os.environ.get(DRIVE_FOLDER_ENV_VAR),
+        help="ID of the Drive folder holding the raw videos. Falls back to the "
+        f"{DRIVE_FOLDER_ENV_VAR} environment variable.",
+    )
+    parser.add_argument(
         "--drive-url",
-        default=DRIVE_FOLDER_URL,
-        help="Override the shared Drive folder URL.",
+        default=None,
+        help="Full Drive folder URL. Alternative to --drive-folder-id.",
     )
     parser.add_argument(
         "--dry-run",
@@ -316,6 +328,20 @@ def parse_args() -> argparse.Namespace:
         help="Do not exit with a non-zero status when files are mis-named.",
     )
     return parser.parse_args()
+
+
+def resolve_drive_url(args: argparse.Namespace) -> Optional[str]:
+    """Work out which Drive folder to pull from.
+
+    The folder ID is deliberately not baked into the repository — pass it with
+    ``--drive-folder-id`` or set ``IE_TOWER_DRIVE_FOLDER_ID``. Returns ``None``
+    when neither is supplied.
+    """
+    if args.drive_url:
+        return args.drive_url
+    if args.drive_folder_id:
+        return f"https://drive.google.com/drive/folders/{args.drive_folder_id}"
+    return None
 
 
 def list_videos(root: Path) -> list[Path]:
@@ -349,9 +375,21 @@ def main() -> int:
 
     before = {video.name for video in list_videos(output_dir)}
 
+    drive_url = resolve_drive_url(args)
+
     if args.dry_run:
         print(f"[dry-run] Skipping download. Inspecting {output_dir}.")
     else:
+        if not drive_url:
+            print(
+                "[error] No Drive folder given. Pass --drive-folder-id <id> or set "
+                f"{DRIVE_FOLDER_ENV_VAR}.\n"
+                "[hint]  Only the raw videos come from Drive. The processed frames "
+                "ship as a release asset — run `python scripts/fetch_data.py`.",
+                file=sys.stderr,
+            )
+            return 1
+
         try:
             import gdown  # type: ignore[import-untyped]
         except ImportError:  # pragma: no cover - import guard
@@ -361,7 +399,7 @@ def main() -> int:
             )
             return 1
 
-        print(f"[sync] Downloading from {args.drive_url}")
+        print(f"[sync] Downloading from {drive_url}")
         print(f"[sync] Target directory: {output_dir}")
         try:
             # gdown 6.x removed `remaining_ok`; folders with 50+ files now
@@ -369,7 +407,7 @@ def main() -> int:
             # arguments compatible with both 5.x and 6.x: url, output,
             # quiet, use_cookies, resume.
             gdown.download_folder(
-                url=args.drive_url,
+                url=drive_url,
                 output=str(output_dir),
                 quiet=False,
                 use_cookies=False,

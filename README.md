@@ -27,6 +27,7 @@ The interactive layer is split between a Marimo dashboard (`app/demo.py`) and a 
 
 ```mermaid
 flowchart TD
+    R["GitHub release<br/>ie-tower-frames-blurred.tar.gz"] -->|"fetch_data.py"| C
     A["Team Google Drive<br/>raw .mov uploads"] -->|"sync_drive_data.py"| B["data/raw_videos/<br/>fNN_area_descriptor.mov"]
     B -->|"extract_frames_and_update_csv.py<br/>ffmpeg at 1 FPS"| C["data/processed_frames/floorN/<br/>JPEG frames"]
     C -->|"appends one row per frame"| D["data/metadata/dataset.csv"]
@@ -42,13 +43,14 @@ flowchart TD
 
 ## Quick start (one command)
 
-Assumes your videos are already uploaded to the team Drive with the canonical naming convention (see "Team data ingestion" below).
+Works from a fresh clone. The frames are not committed — the first stage pulls them from the dataset release, so no Drive access is needed.
 
 ```bash
 # 1. Install dependencies (ffmpeg ships via imageio-ffmpeg, no system install needed).
 pip install -r requirements.txt
 
-# 2. Run the entire pipeline. Auto-skips stages whose output is already on disk.
+# 2. Run the entire pipeline. Stage 1 downloads the frames (~147 MB) if they
+#    are not already on disk; every stage auto-skips work that is already done.
 python scripts/run_all.py
 
 # 3. Open the demo (one of these):
@@ -60,21 +62,23 @@ That's it. `run_all.py` orchestrates 6 stages and **detects what is already done
 
 | Stage | What it does | Skip condition |
 |---|---|---|
-| 1. SYNC | `gdown` the Drive folder into `data/raw_videos/` and rename every legacy upload to the canonical `fNN_<area>_<descriptor>.<ext>`. | `data/raw_videos/` already has at least 10 canonical videos. |
-| 2. EXTRACT | Run ffmpeg at 1 FPS over every video, write JPEGs to `data/processed_frames/floorN/`, append rows to `data/metadata/dataset.csv`. | Every video in `data/raw_videos/` already has frames on disk. |
-| 3. ANNOTATE | Populate `area`, `section` and `floor_range` columns on `dataset.csv` from each frame's filename and label. Feeds the four-tier hierarchical predictor. | Every row already has those three columns filled. |
-| 4. SPLITS | Populate `dataset.csv`'s `split` column with a deterministic stride-based gallery / query partition. | Every CSV row already has a non-empty `split`. |
-| 5. PIPELINE | Extract ResNet50 / DINOv2 embeddings, save them, and build a FAISS Flat-IP index. | `gallery_embeddings.npy`, `gallery_metadata.csv`, and `gallery.index` all exist. |
-| 6. EVAL | Compute Top-1 / Top-5 accuracy and mAP plus the hierarchical metric block, write `outputs/results/evaluation.json`. | `evaluation.json` already exists. |
+| 1. FETCH | Download `ie-tower-frames-blurred.tar.gz` from the dataset release and unpack it into `data/processed_frames/`. | The full 2877 frames are already on disk. |
+| 2. SYNC | `gdown` the Drive folder into `data/raw_videos/` and rename every legacy upload to the canonical `fNN_<area>_<descriptor>.<ext>`. Only needed to rebuild the frames from source. | `data/raw_videos/` already has at least 10 canonical videos, or the frames are present and no Drive folder is configured. |
+| 3. EXTRACT | Run ffmpeg at 1 FPS over every video, write JPEGs to `data/processed_frames/floorN/`, append rows to `data/metadata/dataset.csv`. | Every video in `data/raw_videos/` already has frames on disk. |
+| 4. ANNOTATE | Populate `area`, `section` and `floor_range` columns on `dataset.csv` from each frame's filename and label. Feeds the four-tier hierarchical predictor. | Every row already has those three columns filled. |
+| 5. SPLITS | Populate `dataset.csv`'s `split` column with a deterministic stride-based gallery / query partition. | Every CSV row already has a non-empty `split`. |
+| 6. PIPELINE | Extract ResNet50 / DINOv2 embeddings, save them, and build a FAISS Flat-IP index. | `gallery_embeddings.npy`, `gallery_metadata.csv`, and `gallery.index` all exist. |
+| 7. EVAL | Compute Top-1 / Top-5 accuracy and mAP plus the hierarchical metric block, write `outputs/results/evaluation.json`. | `evaluation.json` already exists. |
 
-**Force a re-run** of one stage with `--force-sync`, `--force-extract`, `--force-annotate`, `--force-splits`, `--force-pipeline`, or `--force-eval`. Force everything with `--force`. Skip a stage entirely (e.g. offline) with `--skip-sync` and friends.
+**Force a re-run** of one stage with `--force-fetch`, `--force-sync`, `--force-extract`, `--force-annotate`, `--force-splits`, `--force-pipeline`, or `--force-eval`. Force everything with `--force`. Skip a stage entirely (e.g. offline) with `--skip-sync` and friends.
 
 ### Standalone stage scripts (advanced)
 
 If you want to run a single stage manually instead of going through `run_all.py`:
 
 ```bash
-python scripts/sync_drive_data.py
+python scripts/fetch_data.py
+python scripts/sync_drive_data.py --drive-folder-id <id>
 python scripts/extract_frames_and_update_csv.py
 python scripts/assign_splits.py
 python scripts/run_pipeline.py
@@ -93,7 +97,7 @@ ie-tower-visual-place-recognition/
 │   └── demo.py                # Marimo notebook for interactive testing
 ├── data/
 │   ├── metadata/dataset.csv   # The single source of truth for the dataset
-│   ├── processed_frames/      # Extracted JPGs (~2.9k files, ~120 MB, committed)
+│   ├── processed_frames/      # Extracted JPGs (2877 files, from the release; gitignored)
 │   └── raw_videos/            # Source videos pulled from Drive (gitignored)
 ├── outputs/
 │   ├── embeddings/            # .npy + metadata CSV
@@ -105,11 +109,12 @@ ie-tower-visual-place-recognition/
 │   ├── build_index.py                   # FAISS index from existing embeddings
 │   ├── extract_embeddings.py            # Standalone embedding extraction
 │   ├── extract_frames_and_update_csv.py # Video -> frames -> CSV (append mode)
+│   ├── fetch_data.py                    # Download the frames from the release
 │   ├── fine_tune_head.py                # Triplet-loss projection head training
 │   ├── run_evaluation.py                # Top-K accuracy + mAP -> JSON
 │   ├── run_pipeline.py                  # Full pipeline: embeddings + index
 │   ├── run_query.py                     # CLI single-image query
-│   └── sync_drive_data.py               # gdown wrapper for the team Drive
+│   └── sync_drive_data.py               # gdown wrapper for the raw-video Drive folder
 ├── src/
 │   ├── data/                  # Dataset loader, frame extractor
 │   ├── evaluation/            # Metrics and evaluation orchestration
@@ -123,38 +128,68 @@ ie-tower-visual-place-recognition/
 
 ---
 
+## Data & privacy
+
+The 2877 processed frames are **not committed to this repository**. They ship as a release asset and are pulled on demand:
+
+```bash
+python scripts/fetch_data.py            # ~147 MB into data/processed_frames/
+```
+
+`run_all.py` runs this automatically as stage 1, so the one-command quick start still works from a fresh clone.
+
+**Faces are blurred.** The frames were recorded in a working building, so people appear in them. Before publishing the dataset every frame was run through an automated face-detection pass (OpenCV Haar frontal + profile cascades) and each detected region was covered with a strong Gaussian blur. 2458 regions across 1396 of the 2877 frames were blurred.
+
+This is a mitigation, not a guarantee. Automated detection misses faces — people seen from behind or from a steep angle, faces that are small, motion-blurred, or partly occluded, and reflections in glass. It also over-triggers on flat architectural surfaces, so some walls and glass panels are blurred where there was never a face. If you spot a frame that still identifies someone, open an issue and it will be removed.
+
+**Raw videos are never published.** They stay in the team Drive and are gitignored. The Drive folder ID is not stored in this repository — pass it with `--drive-folder-id` or set `IE_TOWER_DRIVE_FOLDER_ID` (see below).
+
+---
+
 ## Team data ingestion
 
 ### Drive folder
 
-All raw videos live in the shared Google Drive folder: <https://drive.google.com/drive/folders/1b37B-V67FRRttLNrbHQ0bk4uywsZpiDH>.
+The raw videos live in a shared Google Drive folder. Its ID is deliberately kept out of the repository, so the sync script takes it as an argument:
+
+```bash
+python scripts/sync_drive_data.py --drive-folder-id <id>
+# or:
+export IE_TOWER_DRIVE_FOLDER_ID=<id>
+python scripts/sync_drive_data.py
+```
 
 The folder must remain shared as **"anyone with the link can view"** so `gdown` can enumerate it without OAuth.
 
+You only need this to regenerate the frames from source. To just run the pipeline, use `scripts/fetch_data.py`.
+
 ### Dataset coverage
 
-| Label group | Labels | CSV rows | Frames in repo | Raw videos in Drive |
+| Label group | Labels | CSV rows | Frames (from the release) | Raw videos in Drive |
 |-------|--------|---------|----------------|---------------------|
-| Mid-rise | `floor10..16` | 925 | committed (`data/processed_frames/floor10..16/`) | 33 videos |
-| Low-rise | `floor3..9` | 759 | committed (`data/processed_frames/floor3..9/`) | 28 videos |
-| High-rise | `floor17..23` | 721 | committed (`data/processed_frames/floor17..23/`) | 30 videos |
-| Basements | `basement0`, `basement2`, `basement3`, `basement4` | 472 | committed (`data/processed_frames/basement{0,2,3,4}/`) | 32 videos |
-| **Total** | **25 labels** | **2877** | **all on disk** | **123 videos** |
+| Mid-rise | `floor10..16` | 925 | `data/processed_frames/floor10..16/` | 33 videos |
+| Low-rise | `floor3..9` | 759 | `data/processed_frames/floor3..9/` | 28 videos |
+| High-rise | `floor17..23` | 721 | `data/processed_frames/floor17..23/` | 30 videos |
+| Basements | `basement0`, `basement2`, `basement3`, `basement4` | 472 | `data/processed_frames/basement{0,2,3,4}/` | 32 videos |
+| **Total** | **25 labels** | **2877** | **one `fetch_data.py` away** | **123 videos** |
 
-**First run after a fresh clone — any machine, 3 commands:**
+**First run after a fresh clone — any machine, 4 commands:**
 ```bash
 # 1. Install (ffmpeg ships via imageio-ffmpeg, no system install needed).
 pip install -r requirements.txt
 
-# 2. Build the feature gallery and the FAISS index. The team's frames are
-#    already committed, so this skips video extraction and goes straight
-#    to the model. Pass --model-name to pick a backbone other than
-#    resnet50 (recommended: dinov2_vits14_hires for production-quality
-#    metrics, dinov2_vits14 for fast iteration).
+# 2. Pull the frames from the dataset release (~147 MB).
+python scripts/fetch_data.py
+
+# 3. Build the feature gallery and the FAISS index. The frames are already
+#    on disk, so this skips video extraction and goes straight to the
+#    model. Pass --model-name to pick a backbone other than resnet50
+#    (recommended: dinov2_vits14_hires for production-quality metrics,
+#    dinov2_vits14 for fast iteration).
 python scripts/run_pipeline.py --model-name dinov2_vits14_hires
 python scripts/run_evaluation.py
 
-# 3. Open the test notebook (Jupyter) or the Marimo dashboard.
+# 4. Open the test notebook (Jupyter) or the Marimo dashboard.
 jupyter notebook notebooks/test_model.ipynb
 # or:
 marimo edit app/demo.py
@@ -196,7 +231,7 @@ These exist for backward compatibility with the 879 rows captured in the first p
 2. Pull them locally with `python scripts/sync_drive_data.py`. The script will warn (and exit non-zero) if anything is mis-named.
 3. Run `python scripts/extract_frames_and_update_csv.py`. By default it runs in append mode, so it preserves the rows other team members already contributed.
 4. Re-run `python scripts/assign_splits.py` so the new rows get a `gallery`/`query` assignment.
-5. Commit the updated `data/metadata/dataset.csv` **and the new frames under `data/processed_frames/`** — both are versioned so a fresh clone can run the pipeline without Drive access. Only the raw videos stay gitignored; share those through Drive.
+5. Commit the updated `data/metadata/dataset.csv`. The frames themselves are **not** committed — `data/processed_frames/` is gitignored. To publish new frames, blur the faces, repack the tarball, and attach it to a new dataset release, then bump `EXPECTED_FRAMES` in `scripts/fetch_data.py` and `scripts/run_all.py`.
 
 ---
 
@@ -437,9 +472,11 @@ PR-A (hierarchical predictor), PR-B (OCR override) and PR-C (triplet fine-tuning
 |---|---|
 | `gdown` fails with "Failed to retrieve folder contents" | Drive permissions changed. Confirm the folder is "anyone with the link can view". If Drive is rate-limiting, wait and retry. |
 | `sync_drive_data.py` exits with code 2 | A file in the Drive does not match the canonical naming convention. The script lists the offending paths — rename them in Drive (not locally). |
+| `sync_drive_data.py` exits with code 1 and "No Drive folder given" | Pass `--drive-folder-id <id>` or set `IE_TOWER_DRIVE_FOLDER_ID`. If you only want to run the pipeline, you do not need the raw videos — run `python scripts/fetch_data.py` instead. |
+| `fetch_data.py` fails with a 404 | The release tag moved. Check <https://github.com/JSebastianIEU/ie-tower-visual-place-recognition/releases> and pass `--tag`. |
 | `extract_frames_and_update_csv.py` raises `Could not infer floor from video name` | The video filename does not start with `fNN_` (above-ground) or `bN_` (basement). Rename it in Drive, re-run sync. |
 | `extract_frames` / ffmpeg fails with `No such file or directory` on a path that clearly exists (Windows + non-ASCII username, e.g. `Peña`) | Already handled — `src/data/extract_frames.py` converts every path it passes to ffmpeg (input video, output dir, ffmpeg binary itself) to its Windows 8.3 short form via `GetShortPathNameW`, so ffmpeg sees pure-ASCII paths like `C:\Users\JUANSE~1\…`. No system or username changes are needed. If you somehow still hit this, confirm the file exists with `Path(...).exists()` from Python and report it. |
-| `run_pipeline.py` crashes with `FileNotFoundError` on a frame path | The CSV references frames that aren't on disk. Run `sync_drive_data.py` and `extract_frames_and_update_csv.py` again to regenerate the frames. |
+| `run_pipeline.py` crashes with `FileNotFoundError` on a frame path | The CSV references frames that aren't on disk. Run `python scripts/fetch_data.py` to pull the published frames, or re-extract them from the raw videos. |
 | `run_evaluation.py` reports unexpectedly high Top-1 (>0.99) | Likely consecutive-frame leakage (see "What the metrics mean" #1). Increase `--every` in `assign_splits.py` and re-run, or capture a second pass of videos for honest queries. |
 | `run_evaluation.py` falls back to "no split" mode | The CSV has no `split` column populated. Run `python scripts/assign_splits.py`. |
 | Marimo demo shows "Setup required" | Embeddings or FAISS index are missing. Run `python scripts/run_pipeline.py`. |

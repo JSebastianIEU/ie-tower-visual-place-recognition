@@ -6,15 +6,22 @@ but this top-level wrapper saves the user from having to remember the order
 or which steps still need running.
 
 Stages:
-  1. sync_drive_data.py            — pull team videos from Drive into data/raw_videos/
-  2. extract_frames_and_update_csv.py — extract 1 FPS frames + update dataset.csv
-  3. assign_splits.py              — populate the gallery / query split column
-  4. run_pipeline.py               — extract embeddings + build FAISS index
-  5. run_evaluation.py             — compute Top-K accuracy + mAP
+  1. fetch_data.py                 — download the processed frames release asset
+  2. sync_drive_data.py            — pull team videos from Drive into data/raw_videos/
+  3. extract_frames_and_update_csv.py — extract 1 FPS frames + update dataset.csv
+  4. assign_splits.py              — populate the gallery / query split column
+  5. run_pipeline.py               — extract embeddings + build FAISS index
+  6. run_evaluation.py             — compute Top-K accuracy + mAP
+
+Only stage 1 is needed to get a fresh clone running. Stages 2-3 rebuild the
+frames from the raw videos and are skipped unless a Drive folder is configured.
 
 Skip detection (per stage):
-  1. SYNC      — skipped if data/raw_videos/ already contains at least
-                 ``min_videos`` files matching the canonical regex.
+  1. FETCH     — skipped if data/processed_frames/ already holds the full
+                 frame count.
+  2. SYNC      — skipped if data/raw_videos/ already contains at least
+                 ``min_videos`` files matching the canonical regex, or if the
+                 frames are present and no Drive folder is configured.
   2. EXTRACT   — skipped if every CSV row's image_path resolves to an
                  existing JPG **and** every video in raw_videos/ has frames
                  on disk.
@@ -35,6 +42,7 @@ Skip a stage entirely with ``--skip-sync`` (useful offline) or the matching
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -64,6 +72,10 @@ CANONICAL_VIDEO_REGEX = re.compile(
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 
 
+EXPECTED_FRAMES = 2877
+DRIVE_FOLDER_ENV_VAR = "IE_TOWER_DRIVE_FOLDER_ID"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -75,7 +87,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Re-run every stage, ignoring auto-skip detection.",
     )
-    for stage in ("sync", "extract", "annotate", "splits", "pipeline", "eval"):
+    for stage in ("fetch", "sync", "extract", "annotate", "splits", "pipeline", "eval"):
         parser.add_argument(
             f"--force-{stage}",
             action="store_true",
@@ -123,12 +135,34 @@ def list_canonical_videos(root: Path) -> list[Path]:
     ]
 
 
+def count_frames() -> int:
+    if not PROCESSED_FRAMES_DIR.exists():
+        return 0
+    return sum(1 for _ in PROCESSED_FRAMES_DIR.rglob("*.jpg"))
+
+
+def needs_fetch() -> tuple[bool, str]:
+    frames = count_frames()
+    if frames >= EXPECTED_FRAMES:
+        return False, f"{frames} frames already on disk."
+    return True, f"only {frames} frames on disk; pulling the dataset release."
+
+
 def needs_sync(min_videos: int) -> tuple[bool, str]:
     canonical = list_canonical_videos(RAW_VIDEOS_DIR)
     if len(canonical) >= min_videos:
         return False, (
             f"{len(canonical)} canonical videos already on disk "
             f"(threshold {min_videos}). Pass --force-sync to pull anyway."
+        )
+    # The raw videos are only needed to regenerate the frames. If the frames are
+    # already here and no Drive folder is configured, there is nothing to do —
+    # this is the normal path for anyone who cloned the repo and fetched the
+    # dataset release.
+    if not os.environ.get(DRIVE_FOLDER_ENV_VAR) and count_frames() >= EXPECTED_FRAMES:
+        return False, (
+            "frames already on disk and no Drive folder configured "
+            f"({DRIVE_FOLDER_ENV_VAR} unset). Raw videos are not needed."
         )
     return True, f"only {len(canonical)} canonical videos on disk; running gdown sync."
 
@@ -264,8 +298,17 @@ def main() -> None:
     python = sys.executable
 
     maybe_run(
+        "fetch",
+        "1/7 FETCH processed frames from the dataset release",
+        [python, str(SCRIPTS_DIR / "fetch_data.py")],
+        needs_fn=needs_fetch,
+        force=args.force,
+        skip=args.skip_fetch,
+        force_stage=args.force_fetch,
+    )
+    maybe_run(
         "sync",
-        "1/6 SYNC raw videos from Drive",
+        "2/7 SYNC raw videos from Drive",
         [python, str(SCRIPTS_DIR / "sync_drive_data.py"), "--no-strict"],
         needs_fn=lambda: needs_sync(args.min_videos),
         force=args.force,
@@ -274,7 +317,7 @@ def main() -> None:
     )
     maybe_run(
         "extract",
-        "2/6 EXTRACT frames + update CSV",
+        "3/7 EXTRACT frames + update CSV",
         [python, str(SCRIPTS_DIR / "extract_frames_and_update_csv.py")],
         needs_fn=needs_extract,
         force=args.force,
@@ -283,7 +326,7 @@ def main() -> None:
     )
     maybe_run(
         "annotate",
-        "3/6 ANNOTATE area / section / floor_range",
+        "4/7 ANNOTATE area / section / floor_range",
         [python, str(SCRIPTS_DIR / "annotate_hierarchy.py")],
         needs_fn=needs_annotate,
         force=args.force,
@@ -292,7 +335,7 @@ def main() -> None:
     )
     maybe_run(
         "splits",
-        "4/6 ASSIGN gallery / query splits",
+        "5/7 ASSIGN gallery / query splits",
         [python, str(SCRIPTS_DIR / "assign_splits.py")],
         needs_fn=needs_splits,
         force=args.force,
@@ -301,7 +344,7 @@ def main() -> None:
     )
     maybe_run(
         "pipeline",
-        "5/6 EXTRACT embeddings + BUILD FAISS index",
+        "6/7 EXTRACT embeddings + BUILD FAISS index",
         [python, str(SCRIPTS_DIR / "run_pipeline.py")],
         needs_fn=needs_pipeline,
         force=args.force,
@@ -310,7 +353,7 @@ def main() -> None:
     )
     maybe_run(
         "eval",
-        "6/6 EVALUATE retrieval quality",
+        "7/7 EVALUATE retrieval quality",
         [python, str(SCRIPTS_DIR / "run_evaluation.py")],
         needs_fn=needs_eval,
         force=args.force,
