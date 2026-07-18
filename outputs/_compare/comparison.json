@@ -1,26 +1,79 @@
 {
+  "_note": "Backbone comparison on the IE Tower dataset, 2877 frames, 25 labels, 504 held-out queries, cosine/Flat-IP, seed 42. \"pre_blur\" is the original frames; \"published\" is the face-blurred v1.0-dataset asset that scripts/fetch_data.py downloads. Both arms were extracted on the same device; re-running the pre-blur frames reproduced the original figures exactly, so the difference is the blur alone.",
   "resnet50": {
-    "top_1_accuracy": 0.46825396825396826,
-    "top_5_accuracy": 0.6924603174603174,
-    "mAP": 0.5258680555555556,
-    "pipeline_seconds": 337.8
+    "pre_blur": {
+      "top_1_accuracy": 0.46825396825396826,
+      "top_5_accuracy": 0.6924603174603174,
+      "mAP": 0.5258680555555556
+    },
+    "published": {
+      "top_1_accuracy": 0.4662698412698413,
+      "top_5_accuracy": 0.6746031746031746,
+      "mAP": 0.5195464065255732
+    },
+    "delta_pp": {
+      "top_1_accuracy": -0.2,
+      "top_5_accuracy": -1.79,
+      "mAP": -0.63
+    },
+    "pipeline_seconds": 337.8,
+    "num_queries": 504
   },
   "dinov2_vits14": {
-    "top_1_accuracy": 0.49206349206349204,
-    "top_5_accuracy": 0.748015873015873,
-    "mAP": 0.5587218915343914,
-    "pipeline_seconds": 371.5
+    "pre_blur": {
+      "top_1_accuracy": 0.49206349206349204,
+      "top_5_accuracy": 0.748015873015873,
+      "mAP": 0.5587218915343914
+    },
+    "published": {
+      "top_1_accuracy": 0.4722222222222222,
+      "top_5_accuracy": 0.7321428571428571,
+      "mAP": 0.5424548059964727
+    },
+    "delta_pp": {
+      "top_1_accuracy": -1.98,
+      "top_5_accuracy": -1.59,
+      "mAP": -1.63
+    },
+    "pipeline_seconds": 371.5,
+    "num_queries": 504
   },
   "dinov2_vitb14": {
-    "top_1_accuracy": 0.49404761904761907,
-    "top_5_accuracy": 0.7242063492063492,
-    "mAP": 0.5596119929453263,
-    "pipeline_seconds": 1050.7
+    "pre_blur": {
+      "top_1_accuracy": 0.49404761904761907,
+      "top_5_accuracy": 0.7242063492063492,
+      "mAP": 0.5596119929453263
+    },
+    "published": {
+      "top_1_accuracy": 0.4861111111111111,
+      "top_5_accuracy": 0.7182539682539683,
+      "mAP": 0.5482060185185186
+    },
+    "delta_pp": {
+      "top_1_accuracy": -0.79,
+      "top_5_accuracy": -0.6,
+      "mAP": -1.14
+    },
+    "pipeline_seconds": 1050.7,
+    "num_queries": 504
   },
   "dinov2_vits14_hires": {
-    "top_1_accuracy": 0.5277777777777778,
-    "top_5_accuracy": 0.7202380952380952,
-    "mAP": 0.5772018298059964,
-    "pipeline_seconds": null
+    "pre_blur": {
+      "top_1_accuracy": 0.5277777777777778,
+      "top_5_accuracy": 0.7202380952380952,
+      "mAP": 0.5772018298059964
+    },
+    "published": {
+      "top_1_accuracy": 0.5138888888888888,
+      "top_5_accuracy": 0.7043650793650794,
+      "mAP": 0.5608024691358025
+    },
+    "delta_pp": {
+      "top_1_accuracy": -1.39,
+      "top_5_accuracy": -1.59,
+      "mAP": -1.64
+    },
+    "pipeline_seconds": null,
+    "num_queries": 504
   }
 }

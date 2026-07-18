@@ -6,18 +6,18 @@ This repository hosts a modular Visual Place Recognition (VPR) pipeline for the 
 
 The pipeline is intentionally small and decoupled: each step is a standalone script, every artifact is reproducible from the script that produced it, and the feature-extractor backbone, FAISS metric, frame rate, and split strategy are all swap-in/swap-out parameters.
 
-**Current best configuration** (full dataset, 2877 frames, 25 labels, CPU inference):
+**Current best configuration** (published dataset, 2877 frames, 25 labels, CPU inference):
 
 | Metric | Value |
 |---|---|
-| Top-1 accuracy | **52.8 %** |
-| Top-5 accuracy | 72.0 % |
-| mAP            | **57.7 %** |
+| Top-1 accuracy | **51.4 %** |
+| Top-5 accuracy | 70.4 % |
+| mAP            | **56.1 %** |
 | Backbone       | DINOv2 ViT-S/14 at 518×518, frozen |
 | Index          | FAISS Flat-IP over L2-normalised embeddings |
-| Held-out queries | ~430, stride-based per video |
+| Held-out queries | 504, stride-based per video |
 
-These are the numbers on `main`. The next iteration will tackle the documented failure modes (vertical confusion across above-ground floors, single-pass-per-floor data) — see "Analysis: why isn't accuracy higher?" near the bottom of this file.
+These are the numbers on `main`, measured on the face-blurred frames that `scripts/fetch_data.py` downloads — the same data anyone cloning this repository gets. See "What the blur cost" below for how they compare to the pre-blur figures. The next iteration will tackle the documented failure modes (vertical confusion across above-ground floors, single-pass-per-floor data) — see "Analysis: why isn't accuracy higher?" near the bottom of this file.
 
 The interactive layer is split between a Marimo dashboard (`app/demo.py`) and a Jupyter notebook (`notebooks/test_model.ipynb`). The core pipeline lives in regular Python modules under `src/` and `scripts/`, so contributions to feature extraction, retrieval or evaluation can land independently.
 
@@ -259,16 +259,33 @@ python scripts/run_pipeline.py --model-name dinov2_vitb14         # bigger DINOv
 python scripts/run_pipeline.py --model-name resnet50              # fallback
 ```
 
-Empirical comparison on the full IE Tower dataset (2877 frames, 25 labels = 21 floors + 4 basements), CPU inference:
+Empirical comparison on the full IE Tower dataset (2877 frames, 25 labels = 21 floors + 4 basements, 504 held-out queries), CPU inference. Measured on the published face-blurred frames:
 
 | Backbone | Top-1 | Top-5 | mAP | Pipeline time (CPU) |
 |---|---|---|---|---|
-| `resnet50` | 0.468 | 0.692 | 0.526 | ~6 min |
-| `dinov2_vits14` (224x224) | 0.492 | **0.748** | 0.559 | ~6 min |
-| `dinov2_vitb14` (224x224) | 0.494 | 0.724 | 0.560 | ~17 min |
-| **`dinov2_vits14_hires`** (518x518) | **0.528** | 0.720 | **0.577** | ~25 min |
+| `resnet50` | 0.466 | 0.675 | 0.520 | ~6 min |
+| `dinov2_vits14` (224x224) | 0.472 | **0.732** | 0.542 | ~6 min |
+| `dinov2_vitb14` (224x224) | 0.486 | 0.718 | 0.548 | ~17 min |
+| **`dinov2_vits14_hires`** (518x518) | **0.514** | 0.704 | **0.561** | ~25 min |
 
 DINOv2 is self-supervised on 142M images and produces features that are more semantically organised than ImageNet-pretrained ResNet50, which is reflected in every metric. ViT-S vs ViT-B differ by less than 1 pp on this dataset but ViT-B is ~3x slower on CPU. Bumping ViT-S to its native 518x518 resolution (`_hires`) gives the strongest Top-1 and mAP (+3.6 pp / +1.8 pp over the 224 variant) at the cost of running ~4x slower because the ViT processes 5x more patches.
+
+### What the blur cost
+
+The frames published in `v1.0-dataset` are face-blurred (see "Faces are blurred" in the release notes). Earlier versions of this README quoted **52.8 % Top-1 / 72.0 % Top-5 / 57.7 % mAP**, measured before that blur was applied. Since a blurred dataset is what anyone cloning this repository actually gets, the headline numbers have been re-measured on it.
+
+Both arms were re-extracted on the same device and the same 504-query split, so the only variable is the pixels:
+
+| Backbone | Top-1 (pre-blur → published data) | Top-5 | mAP |
+|---|---|---|---|
+| `resnet50` | 0.468 → 0.466 (−0.20 pp) | 0.692 → 0.675 (−1.79 pp) | 0.526 → 0.520 (−0.63 pp) |
+| `dinov2_vits14` | 0.492 → 0.472 (−1.98 pp) | 0.748 → 0.732 (−1.59 pp) | 0.559 → 0.542 (−1.63 pp) |
+| `dinov2_vitb14` | 0.494 → 0.486 (−0.79 pp) | 0.724 → 0.718 (−0.60 pp) | 0.560 → 0.548 (−1.14 pp) |
+| **`dinov2_vits14_hires`** | **0.528 → 0.514 (−1.39 pp)** | **0.720 → 0.704 (−1.59 pp)** | **0.577 → 0.561 (−1.64 pp)** |
+
+**The blur costs about 1.5 pp and changes nothing structural.** Re-running the pre-blur frames reproduced every previously published figure exactly, so the deltas above are attributable to the blur alone and not to a library or hardware change. The ranking of the four backbones is unchanged, `dinov2_vits14_hires` is still the best configuration on Top-1 and mAP, and the failure modes described further down are the same ones. 1396 of the 2877 frames carry at least one blurred region; the other 1481 are bit-identical to the originals.
+
+The detector also over-triggers on flat walls and glass, which is the kind of large low-texture surface place recognition leans on, so a small loss is the expected outcome rather than a surprising one. It is not large enough to change any conclusion in this repository.
 
 **Recommended defaults:**
 - `dinov2_vits14` for fast iteration / low-end laptops.
@@ -279,8 +296,13 @@ Common overrides:
 
 ```bash
 python scripts/run_pipeline.py --batch-size 32 --device cuda
+python scripts/run_pipeline.py --device mps         # Apple Silicon GPU
 python scripts/run_pipeline.py --metric l2          # use L2 instead of cosine
 ```
+
+The device is auto-selected in the order **cuda → mps → cpu**, so on an Apple Silicon laptop the GPU is used without passing anything. That takes the `dinov2_vits14_hires` extraction over all 2877 frames from roughly 6 minutes on CPU to about 90 seconds. Pass `--device cpu` to force the CPU path.
+
+One caveat worth knowing: MPS and CPU do not produce bit-identical floating point (about 1e-5 on a 384-d embedding). That was not enough to move any metric in our runs — the same evaluation on both devices returned identical Top-1/Top-5/mAP — but if you are comparing two configurations, extract both on the same device rather than mixing.
 
 ### Model artifacts — what gets saved and where
 
@@ -340,7 +362,7 @@ Both options assume the pipeline has been built once. If the index files are mis
 
 ## Analysis: why isn't accuracy higher?
 
-Where we are on the full 25-label dataset (DINOv2 ViT-S at 518×518): **52.8 % Top-1, 72.0 % Top-5, 57.7 % mAP**. Going from ResNet50 to DINOv2 already gave us +6 pp on Top-1 and +5 pp on mAP — that was the cheap win from a stronger frozen backbone. The remaining ceiling has three structural causes:
+Where we are on the full 25-label dataset (DINOv2 ViT-S at 518×518): **51.4 % Top-1, 70.4 % Top-5, 56.1 % mAP**. Going from ResNet50 to DINOv2 already gave us +6 pp on Top-1 and +5 pp on mAP — that was the cheap win from a stronger frozen backbone. The remaining ceiling has three structural causes:
 
 1. **Vertical layout repetition.** The IE Tower repeats the same hallway, elevator and stairwell layout on almost every above-ground floor. ResNet50 / DINOv2 cannot read floor-number signage, so `floor10_hallway_left` and `floor15_hallway_left` look interchangeable in feature space. The per-class breakdown saved by `run_evaluation.py` makes this very visible — basements (architecturally distinct) reach **77–87 %** Top-1, while the middle above-ground floors hover around **30–55 %**.
 2. **Single-pass-per-floor data.** Every gallery frame and every query frame come from the *same* phone walkthrough at the same moment in time. With a stride-based split the nearest gallery neighbour for a query is usually a frame from the same continuous video, two seconds away. That makes the metrics easier to game than what a real user would see (a fresh photo on a different day with a different phone). The honest fix is *new data*, not a different model.
@@ -451,7 +473,7 @@ Only `split == "gallery"` rows are used for training; the `split == "query"` row
 | `head_residual_m0.20.pth` | residual | 0.20 |
 | `projection_head.pth` | best run, default output name | — |
 
-`outputs/ft_models/training_log.json` holds the per-epoch loss/accuracy trace and the full config dict for the most recent run. That run (non-residual, out-dim 384, margin 0.20, 60 epochs, seed 42) moved held-out accuracy from **48.6 % to 56.0 % Top-1** and **69.8 % to 73.2 % Top-5** — roughly **+7 pp** Top-1 over the same embeddings unprojected.
+`outputs/ft_models/training_log.json` holds the per-epoch loss/accuracy trace and the full config dict for the most recent run. That run (non-residual, out-dim 384, margin 0.20, 60 epochs, seed 42) moved held-out accuracy from **48.6 % to 56.0 % Top-1** and **69.8 % to 73.2 % Top-5** — roughly **+7 pp** Top-1 over the same embeddings unprojected. Those two figures were measured before the dataset was face-blurred and have not been re-run since; treat them as indicative of the head's effect, not as current numbers on the published data.
 
 Read that gain with the same caveat as every other number here: the held-out queries still come from the same single walkthrough as the gallery frames, so the head is partly learning walkthrough-specific structure. A second capture pass (item 1 in the roadmap below) is what would make this number trustworthy.
 

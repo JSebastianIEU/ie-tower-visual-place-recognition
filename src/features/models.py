@@ -77,6 +77,12 @@ def resolve_device(device: str | None = None) -> torch.device:
         return torch.device(device)
     if torch.cuda.is_available():
         return torch.device("cuda")
+    # Apple Silicon GPU. Roughly 4x faster than CPU for the DINOv2 forward
+    # pass on an M-series laptop. Results are not bit-identical to CPU
+    # (~1e-5 on the embedding), so never mix devices inside one comparison:
+    # re-extract every arm on the same device before comparing metrics.
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
